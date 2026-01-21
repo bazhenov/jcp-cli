@@ -1,16 +1,10 @@
-use acp_jcp::{NewSessionMeta, NewSessionRemote, RawIncomingMessage};
-use agent_client_protocol::{
-    AgentSide, ClientRequest, ClientSide, JsonRpcMessage, NewSessionRequest, OutgoingMessage,
-    Request, Side,
-};
+use acp_jcp::{run_adapter, Config, StdinStream, StdoutSink};
 use dotenv::dotenv;
-use futures::{Sink, Stream};
-use futures_util::{SinkExt, StreamExt};
-use serde_json::Value;
-use std::{env, fmt::Debug};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, stdin, stdout};
+use futures_util::StreamExt;
+use std::env;
+use tokio::io::{stdin, stdout};
 use tokio_tungstenite::connect_async;
-use tungstenite::{Message, Utf8Bytes, client::IntoClientRequest};
+use tungstenite::client::IntoClientRequest;
 
 #[tokio::main]
 async fn main() {
@@ -20,7 +14,7 @@ async fn main() {
         env::var("JBA_ACCESS_TOKEN").expect("JBA_ACCESS_TOKEN env variable should be configured");
     let git_url = env::var("GIT_URL").expect("GIT_URL env variable should be configured");
 
-    let antropic_key =
+    let anthropic_key =
         env::var("ANTHROPIC_KEY").expect("ANTHROPIC_KEY env variable should be configured");
 
     let jcp_url = env::var("JCP_URL")
@@ -33,91 +27,19 @@ async fn main() {
         format!("Bearer {jba_access_token}").parse().unwrap(),
     );
 
-    let new_session_request_meta = NewSessionMeta {
-        remote: NewSessionRemote {
-            branch: "main".into(),
-            url: git_url.clone(),
-            revision: "main".into(),
-        },
-        jb_ai_token: antropic_key.clone(),
+    let config = Config {
+        git_url,
+        branch: "main".into(),
+        revision: "main".into(),
+        jb_ai_token: anthropic_key,
         supports_user_git_auth_flow: false,
     };
 
     let (ws_stream, _) = connect_async(request).await.unwrap();
     let (server_tx, server_rx) = ws_stream.split();
 
-    // Client (IDE) -> Server task
-    let uplink_task = tokio::spawn(uplink_task(server_tx, new_session_request_meta));
-    // Server -> Client task
-    let downlink_task = tokio::spawn(downlink_task(server_rx));
+    let client_rx = StdinStream::new(stdin());
+    let client_tx = StdoutSink::new(stdout());
 
-    let _ = tokio::join!(uplink_task, downlink_task);
-}
-
-async fn downlink_task<S: Stream<Item = Result<Message, tungstenite::Error>> + Unpin>(
-    mut server_rx: S,
-) {
-    let mut client_rx = stdout();
-    loop {
-        let server_to_client_msg = server_rx.next().await;
-        if let Some(msg) = server_to_client_msg.transpose().unwrap() {
-            let data = msg.into_data();
-            client_rx.write_all(&data).await.unwrap();
-            // We need to add newline to frame an JSON-RPC message in stdout
-            client_rx.write_all(b"\n").await.unwrap();
-        } else {
-            break;
-        }
-    }
-}
-
-async fn uplink_task<S: Sink<Message> + Unpin>(mut server_tx: S, new_session_meta: NewSessionMeta)
-where
-    S::Error: Debug,
-{
-    let rx = BufReader::new(stdin());
-    let mut rx_lines = rx.lines();
-    loop {
-        if let Some(msg) = rx_lines.next_line().await.unwrap() {
-            let rpc_msg: RawIncomingMessage<'_> = serde_json::from_slice(msg.as_bytes()).unwrap();
-
-            if let Some((method, id)) = rpc_msg.method.zip(rpc_msg.id) {
-                let mut request = AgentSide::decode_request(method, rpc_msg.params).unwrap();
-
-                if let ClientRequest::NewSessionRequest(r) = &mut request {
-                    inject_new_session_meta(r, &new_session_meta);
-                }
-
-                let msg = JsonRpcMessage::wrap(OutgoingMessage::Request::<ClientSide, AgentSide>(
-                    Request {
-                        id,
-                        method: method.into(),
-                        params: Some(request),
-                    },
-                ));
-
-                let json = serde_json::to_string(&msg).unwrap();
-
-                server_tx
-                    .send(Message::Text(Utf8Bytes::from(&json)))
-                    .await
-                    .unwrap();
-            } else {
-                // Sending notifications to an JCP without modification
-                server_tx
-                    .send(Message::Text(Utf8Bytes::from(msg)))
-                    .await
-                    .unwrap();
-            }
-        } else {
-            return;
-        }
-    }
-}
-
-/// JCP needs to know where clone git repo from nad what branch to use
-fn inject_new_session_meta(req: &mut NewSessionRequest, meta: &NewSessionMeta) {
-    if let Value::Object(json) = serde_json::to_value(meta).unwrap() {
-        req.meta = Some(json);
-    }
+    run_adapter(config, client_rx, client_tx, server_rx, server_tx).await;
 }

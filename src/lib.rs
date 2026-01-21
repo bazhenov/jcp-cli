@@ -1,9 +1,138 @@
-use agent_client_protocol::{self as acp, RawValue};
+use agent_client_protocol::{
+    self as acp, AgentSide, ClientRequest, ClientSide, JsonRpcMessage, NewSessionRequest,
+    OutgoingMessage, RawValue, Request, Side,
+};
+use futures::{Sink, Stream};
+use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use std::{fs::File, io::Write};
+use serde_json::Value;
+use std::{
+    fmt::Debug,
+    io,
+    pin::Pin,
+    task::{Context, Poll},
+};
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader, Lines};
+use tungstenite::{Message, Utf8Bytes};
 
-#[derive(Serialize, Deserialize)]
-#[cfg_attr(test, derive(Debug, PartialEq))]
+/// A Stream adapter that reads newline-delimited JSON from an async reader
+pub struct StdinStream<R> {
+    lines: Lines<BufReader<R>>,
+}
+
+impl<R: AsyncRead + Unpin> StdinStream<R> {
+    pub fn new(reader: R) -> Self {
+        Self {
+            lines: BufReader::new(reader).lines(),
+        }
+    }
+}
+
+impl<R: AsyncRead + Unpin> Stream for StdinStream<R> {
+    type Item = Result<String, io::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.lines).poll_next_line(cx).map(|result| {
+            match result {
+                Ok(Some(line)) => Some(Ok(line)),
+                Ok(None) => None, // EOF
+                Err(e) => Some(Err(e)),
+            }
+        })
+    }
+}
+
+/// A Sink adapter that writes newline-delimited strings to an async writer
+pub struct StdoutSink<W> {
+    writer: W,
+    buffer: Vec<u8>,
+    written: usize,
+}
+
+impl<W: tokio::io::AsyncWrite + Unpin> StdoutSink<W> {
+    pub fn new(writer: W) -> Self {
+        Self {
+            writer,
+            buffer: Vec::new(),
+            written: 0,
+        }
+    }
+}
+
+impl<W: tokio::io::AsyncWrite + Unpin> Sink<String> for StdoutSink<W> {
+    type Error = io::Error;
+
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        // Ready when buffer is empty (previous write completed)
+        if self.buffer.is_empty() {
+            Poll::Ready(Ok(()))
+        } else {
+            // Need to flush first
+            self.poll_flush(cx)
+        }
+    }
+
+    fn start_send(mut self: Pin<&mut Self>, item: String) -> Result<(), Self::Error> {
+        // Buffer the data with newline
+        self.buffer.extend_from_slice(item.as_bytes());
+        self.buffer.push(b'\n');
+        self.written = 0;
+        Ok(())
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let this = &mut *self;
+        while this.written < this.buffer.len() {
+            let buf = &this.buffer[this.written..];
+            match Pin::new(&mut this.writer).poll_write(cx, buf) {
+                Poll::Ready(Ok(n)) => {
+                    this.written += n;
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        // All data written, clear buffer
+        this.buffer.clear();
+        this.written = 0;
+        // Flush the underlying writer
+        Pin::new(&mut this.writer).poll_flush(cx)
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        // Flush any remaining data first
+        match self.as_mut().poll_flush(cx) {
+            Poll::Ready(Ok(())) => Pin::new(&mut self.writer).poll_shutdown(cx),
+            other => other,
+        }
+    }
+}
+
+/// Configuration for the ACP-JCP adapter
+#[derive(Clone)]
+pub struct Config {
+    pub git_url: String,
+    pub branch: String,
+    pub revision: String,
+    pub jb_ai_token: String,
+    pub supports_user_git_auth_flow: bool,
+}
+
+impl Config {
+    pub fn new_session_meta(&self) -> NewSessionMeta {
+        NewSessionMeta {
+            remote: NewSessionRemote {
+                branch: self.branch.clone(),
+                url: self.git_url.clone(),
+                revision: self.revision.clone(),
+            },
+            jb_ai_token: self.jb_ai_token.clone(),
+            supports_user_git_auth_flow: self.supports_user_git_auth_flow,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub struct NewSessionMeta {
     #[serde(rename = "remote")]
     pub remote: NewSessionRemote,
@@ -15,8 +144,7 @@ pub struct NewSessionMeta {
     pub supports_user_git_auth_flow: bool,
 }
 
-#[derive(Serialize, Deserialize)]
-#[cfg_attr(test, derive(Debug, PartialEq))]
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub struct NewSessionRemote {
     #[serde(rename = "branch")]
     pub branch: String,
@@ -37,15 +165,99 @@ pub struct RawIncomingMessage<'a> {
     pub error: Option<acp::Error>,
 }
 
-/// Simple wrapper that writes a copy of all traffic in a log file
-struct TrafficLog(Option<File>);
+/// Run the adapter connecting client streams to server streams
+///
+/// This function bridges:
+/// - `client_rx`: incoming string messages from the client (e.g., stdin lines)
+/// - `client_tx`: outgoing string messages to the client (e.g., stdout)
+/// - `server_rx`: incoming messages from the websocket server
+/// - `server_tx`: outgoing messages to the websocket server
+///
+/// Framing (newline delimiting) should be handled by the stream/sink implementations.
+pub async fn run_adapter<ClientRx, ClientTx, ServerRx, ServerTx>(
+    config: Config,
+    client_rx: ClientRx,
+    client_tx: ClientTx,
+    server_rx: ServerRx,
+    server_tx: ServerTx,
+) where
+    ClientRx: Stream<Item = Result<String, io::Error>> + Unpin + Send + 'static,
+    ClientTx: Sink<String> + Unpin + Send + 'static,
+    ClientTx::Error: Debug,
+    ServerRx: Stream<Item = Result<Message, tungstenite::Error>> + Unpin + Send + 'static,
+    ServerTx: Sink<Message> + Unpin + Send + 'static,
+    ServerTx::Error: Debug,
+{
+    let new_session_meta = config.new_session_meta();
 
-impl TrafficLog {
-    fn log(&mut self, data: impl AsRef<[u8]>) {
-        if let Some(file) = self.0.as_mut() {
-            let _ = file.write_all(data.as_ref());
-            let _ = file.write_all(b"\n");
+    let uplink = tokio::spawn(uplink_task(server_tx, client_rx, new_session_meta));
+    let downlink = tokio::spawn(downlink_task(server_rx, client_tx));
+
+    let _ = tokio::join!(uplink, downlink);
+}
+
+/// Server -> Client task: forwards messages from websocket to client
+pub async fn downlink_task<ServerRx, ClientTx>(mut server_rx: ServerRx, mut client_tx: ClientTx)
+where
+    ServerRx: Stream<Item = Result<Message, tungstenite::Error>> + Unpin,
+    ClientTx: Sink<String> + Unpin,
+    ClientTx::Error: Debug,
+{
+    while let Some(msg) = server_rx.next().await {
+        if let Ok(msg) = msg {
+            let data = msg.into_text().unwrap().to_string();
+            client_tx.send(data).await.unwrap();
         }
+    }
+}
+
+/// Client -> Server task: forwards messages from client to websocket
+pub async fn uplink_task<ServerTx, ClientRx>(
+    mut server_tx: ServerTx,
+    mut client_rx: ClientRx,
+    new_session_meta: NewSessionMeta,
+) where
+    ServerTx: Sink<Message> + Unpin,
+    ServerTx::Error: Debug,
+    ClientRx: Stream<Item = Result<String, io::Error>> + Unpin,
+{
+    while let Some(Ok(msg)) = client_rx.next().await {
+        let rpc_msg: RawIncomingMessage<'_> = serde_json::from_slice(msg.as_bytes()).unwrap();
+
+        if let Some((method, id)) = rpc_msg.method.zip(rpc_msg.id) {
+            let mut request = AgentSide::decode_request(method, rpc_msg.params).unwrap();
+
+            if let ClientRequest::NewSessionRequest(r) = &mut request {
+                inject_new_session_meta(r, &new_session_meta);
+            }
+
+            let msg =
+                JsonRpcMessage::wrap(OutgoingMessage::Request::<ClientSide, AgentSide>(Request {
+                    id,
+                    method: method.into(),
+                    params: Some(request),
+                }));
+
+            let json = serde_json::to_string(&msg).unwrap();
+
+            server_tx
+                .send(Message::Text(Utf8Bytes::from(&json)))
+                .await
+                .unwrap();
+        } else {
+            // Sending notifications to JCP without modification
+            server_tx
+                .send(Message::Text(Utf8Bytes::from(msg)))
+                .await
+                .unwrap();
+        }
+    }
+}
+
+/// JCP needs to know where to clone git repo from and what branch to use
+fn inject_new_session_meta(req: &mut NewSessionRequest, meta: &NewSessionMeta) {
+    if let Value::Object(json) = serde_json::to_value(meta).unwrap() {
+        req.meta = Some(json);
     }
 }
 
