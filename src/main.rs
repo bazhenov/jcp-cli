@@ -4,9 +4,11 @@ use agent_client_protocol::{
     Request, RequestId, Side,
 };
 use dotenv::dotenv;
+use futures::{Sink, Stream};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use std::env;
+use std::fmt::Debug;
 use std::{fs::File, io::Write};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, stdin, stdout};
 use tokio_tungstenite::connect_async;
@@ -43,63 +45,64 @@ async fn main() {
         supports_user_git_auth_flow: false,
     };
 
-    let log_file = env::var("TRAFFIC_LOG")
-        .ok()
-        .and_then(|f| File::create(f).ok());
-    let mut traffic_log = TrafficLog(log_file);
-
     let (ws_stream, _) = connect_async(request).await.unwrap();
-    let (mut server_tx, mut server_rx) = ws_stream.split();
+    let (server_tx, server_rx) = ws_stream.split();
 
+    // Uplink task: Client (IDE) -> Server
+    let uplink_task = tokio::spawn(uplink_task(server_tx, new_session_request_meta));
+    let downlink_task = tokio::spawn(downlink_task(server_rx));
+
+    let _ = tokio::join!(uplink_task, downlink_task);
+}
+
+async fn downlink_task<S: Stream<Item = Result<Message, tungstenite::Error>> + Unpin>(
+    mut server_rx: S,
+) {
     let mut client_rx = stdout();
-    let client_tx = BufReader::new(stdin());
-    let mut client_tx_lines = client_tx.lines();
-
     loop {
-        tokio::select! {
-            client_to_server_msg = client_tx_lines.next_line() => {
-                if let Some(msg) = client_to_server_msg.unwrap() {
-                    let rpc_msg: RawIncomingMessage<'_> =
-                        serde_json::from_slice(msg.as_bytes()).unwrap();
+        let server_to_client_msg = server_rx.next().await;
+        if let Some(msg) = server_to_client_msg.transpose().unwrap() {
+            let data = msg.into_data();
+            client_rx.write_all(&data).await.unwrap();
+            // We need to add newline to frame an JSON-RPC message in stdout
+            client_rx.write_all(b"\n").await.unwrap();
+        } else {
+            break;
+        }
+    }
+}
 
-                    if let Some((method, id)) = rpc_msg.method.zip(rpc_msg.id) {
-                        let mut request = AgentSide::decode_request(method, rpc_msg.params).unwrap();
+async fn uplink_task<S: Sink<Message> + Unpin>(mut server_tx: S, new_session_meta: NewSessionMeta)
+where
+    S::Error: Debug,
+{
+    let rx = BufReader::new(stdin());
+    let mut rx_lines = rx.lines();
+    loop {
+        if let Some(msg) = rx_lines.next_line().await.unwrap() {
+            let rpc_msg: RawIncomingMessage<'_> = serde_json::from_slice(msg.as_bytes()).unwrap();
 
-                        if let ClientRequest::NewSessionRequest(r) = &mut request {
-                            inject_new_session_meta(r, &new_session_request_meta);
-                        }
+            if let Some((method, id)) = rpc_msg.method.zip(rpc_msg.id) {
+                let mut request = AgentSide::decode_request(method, rpc_msg.params).unwrap();
 
-                        let json = to_json_rpc(method, id, request).unwrap();
-                        traffic_log.log(&json);
-
-                        server_tx
-                            .send(Message::Text(Utf8Bytes::from(&json)))
-                            .await
-                            .unwrap();
-                    } else {
-                        // Sending notifications to an JCP without modification
-                        traffic_log.log(&msg);
-                        server_tx
-                            .send(Message::Text(Utf8Bytes::from(msg)))
-                            .await
-                            .unwrap();
-                    }
-                } else {
-                    break;
+                if let ClientRequest::NewSessionRequest(r) = &mut request {
+                    inject_new_session_meta(r, &new_session_meta);
                 }
-            },
 
-            server_to_client_msg = server_rx.next() => {
-                if let Some(msg) = server_to_client_msg.transpose().unwrap() {
-                    let data = msg.into_data();
-                    traffic_log.log(&data);
-                    client_rx.write_all(&data).await.unwrap();
-                    // We need to add newline to frame an JSON-RPC message in stdout
-                    client_rx.write_all(b"\n").await.unwrap();
-                } else {
-                    break;
-                }
+                let json = to_json_rpc(method, id, request).unwrap();
+                server_tx
+                    .send(Message::Text(Utf8Bytes::from(&json)))
+                    .await
+                    .unwrap();
+            } else {
+                // Sending notifications to an JCP without modification
+                server_tx
+                    .send(Message::Text(Utf8Bytes::from(msg)))
+                    .await
+                    .unwrap();
             }
+        } else {
+            return;
         }
     }
 }
