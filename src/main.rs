@@ -1,5 +1,5 @@
 use acp_jcp::{NewSessionMeta, NewSessionRemote, RawIncomingMessage};
-use agent_client_protocol::{self as acp, ClientRequest, IncomingMessage, Side};
+use agent_client_protocol::{self as acp, ClientRequest, IncomingMessage, NewSessionRequest, Side};
 use agent_client_protocol::{
     AgentSide, ClientCapabilities, ClientSide, FileSystemCapability, JsonRpcMessage,
     OutgoingMessage, ProtocolVersion, Request, RequestId,
@@ -36,6 +36,16 @@ async fn main() {
         format!("Bearer {jba_access_token}").parse().unwrap(),
     );
 
+    let new_session_request_meta = NewSessionMeta {
+        remote: NewSessionRemote {
+            branch: "main".into(),
+            url: git_url.clone(),
+            revision: "main".into(),
+        },
+        jb_ai_token: antropic_key.clone(),
+        supports_user_git_auth_flow: false,
+    };
+
     let log_file = env::var("TRAFFIC_LOG")
         .ok()
         .and_then(|f| File::create(f).ok());
@@ -58,32 +68,11 @@ async fn main() {
                     if let Some((method, id)) = rpc_msg.method.zip(rpc_msg.id) {
                         let mut request = AgentSide::decode_request(method, rpc_msg.params).unwrap();
 
-                        if let ClientRequest::NewSessionRequest(mut r) = request {
-                            // Inject session/new meta
-                            let remote_meta = NewSessionMeta {
-                                remote: NewSessionRemote {
-                                    branch: "main".into(),
-                                    url: git_url.clone(),
-                                    revision: "main".into(),
-                                },
-                                jb_ai_token: antropic_key.clone(),
-                                supports_user_git_auth_flow: false
-                            };
-
-                            let Value::Object(meta) = serde_json::to_value(remote_meta).unwrap() else {
-                                panic!("Unexpected value");
-                            };
-                            r = r.meta(meta);
-                            request = ClientRequest::NewSessionRequest(r);
+                        if let ClientRequest::NewSessionRequest(r) = &mut request {
+                            inject_new_session_meta(r, &new_session_request_meta);
                         }
 
-                        let msg = JsonRpcMessage::wrap(OutgoingMessage::Request::<ClientSide, AgentSide>(Request {
-                            id,
-                            method: method.into(),
-                            params: Some(request)
-                        }));
-
-                        let json = serde_json::to_string(&msg).unwrap();
+                        let json = to_json_rpc(method, id, request).unwrap();
                         traffic_log.log(&json);
 
                         server_tx
@@ -116,28 +105,27 @@ async fn main() {
             }
         }
     }
+}
 
-    // let rq = acp::ClientRequest::InitializeRequest(
-    //     acp::InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
-    //         ClientCapabilities::new()
-    //             .terminal(false)
-    //             .fs(FileSystemCapability::new()
-    //                 .read_text_file(false)
-    //                 .write_text_file(false)),
-    //     ),
-    // );
+fn to_json_rpc(
+    method: &str,
+    id: RequestId,
+    params: ClientRequest,
+) -> serde_json::error::Result<String> {
+    let msg = JsonRpcMessage::wrap(OutgoingMessage::Request::<ClientSide, AgentSide>(Request {
+        id,
+        method: method.into(),
+        params: Some(params),
+    }));
 
-    // let rpc = JsonRpcMessage::wrap(OutgoingMessage::Request::<ClientSide, AgentSide>(Request {
-    //     id: RequestId::Number(1),
-    //     method: "initialize".into(),
-    //     params: Some(rq),
-    // }));
+    serde_json::to_string(&msg)
+}
 
-    // let string = serde_json::to_string(&rpc).unwrap();
-
-    // let reply = server_rx.next().await.unwrap().unwrap();
-
-    // println!("{reply}");
+/// JCP needs to know where clone git repo from nad what branch to use
+fn inject_new_session_meta(req: &mut NewSessionRequest, meta: &NewSessionMeta) {
+    if let Value::Object(json) = serde_json::to_value(meta).unwrap() {
+        req.meta = Some(json);
+    }
 }
 
 /// Simple wrapper that writes a copy of all traffic in a log file
