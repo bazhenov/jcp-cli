@@ -1,5 +1,6 @@
 use agent_client_protocol::{self as acp, RawValue};
 use serde::{Deserialize, Serialize};
+use std::{fs::File, io::Write};
 
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(test, derive(Debug, PartialEq))]
@@ -34,6 +35,18 @@ pub struct RawIncomingMessage<'a> {
     pub params: Option<&'a RawValue>,
     pub result: Option<&'a RawValue>,
     pub error: Option<acp::Error>,
+}
+
+/// Simple wrapper that writes a copy of all traffic in a log file
+struct TrafficLog(Option<File>);
+
+impl TrafficLog {
+    fn log(&mut self, data: impl AsRef<[u8]>) {
+        if let Some(file) = self.0.as_mut() {
+            let _ = file.write_all(data.as_ref());
+            let _ = file.write_all(b"\n");
+        }
+    }
 }
 
 #[cfg(test)]

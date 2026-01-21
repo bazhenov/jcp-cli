@@ -1,15 +1,13 @@
 use acp_jcp::{NewSessionMeta, NewSessionRemote, RawIncomingMessage};
 use agent_client_protocol::{
     AgentSide, ClientRequest, ClientSide, JsonRpcMessage, NewSessionRequest, OutgoingMessage,
-    Request, RequestId, Side,
+    Request, Side,
 };
 use dotenv::dotenv;
 use futures::{Sink, Stream};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
-use std::env;
-use std::fmt::Debug;
-use std::{fs::File, io::Write};
+use std::{env, fmt::Debug};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, stdin, stdout};
 use tokio_tungstenite::connect_async;
 use tungstenite::{Message, Utf8Bytes, client::IntoClientRequest};
@@ -48,8 +46,9 @@ async fn main() {
     let (ws_stream, _) = connect_async(request).await.unwrap();
     let (server_tx, server_rx) = ws_stream.split();
 
-    // Uplink task: Client (IDE) -> Server
+    // Client (IDE) -> Server task
     let uplink_task = tokio::spawn(uplink_task(server_tx, new_session_request_meta));
+    // Server -> Client task
     let downlink_task = tokio::spawn(downlink_task(server_rx));
 
     let _ = tokio::join!(uplink_task, downlink_task);
@@ -89,7 +88,16 @@ where
                     inject_new_session_meta(r, &new_session_meta);
                 }
 
-                let json = to_json_rpc(method, id, request).unwrap();
+                let msg = JsonRpcMessage::wrap(OutgoingMessage::Request::<ClientSide, AgentSide>(
+                    Request {
+                        id,
+                        method: method.into(),
+                        params: Some(request),
+                    },
+                ));
+
+                let json = serde_json::to_string(&msg).unwrap();
+
                 server_tx
                     .send(Message::Text(Utf8Bytes::from(&json)))
                     .await
@@ -107,35 +115,9 @@ where
     }
 }
 
-fn to_json_rpc(
-    method: &str,
-    id: RequestId,
-    params: ClientRequest,
-) -> serde_json::error::Result<String> {
-    let msg = JsonRpcMessage::wrap(OutgoingMessage::Request::<ClientSide, AgentSide>(Request {
-        id,
-        method: method.into(),
-        params: Some(params),
-    }));
-
-    serde_json::to_string(&msg)
-}
-
 /// JCP needs to know where clone git repo from nad what branch to use
 fn inject_new_session_meta(req: &mut NewSessionRequest, meta: &NewSessionMeta) {
     if let Value::Object(json) = serde_json::to_value(meta).unwrap() {
         req.meta = Some(json);
-    }
-}
-
-/// Simple wrapper that writes a copy of all traffic in a log file
-struct TrafficLog(Option<File>);
-
-impl TrafficLog {
-    fn log(&mut self, data: impl AsRef<[u8]>) {
-        if let Some(file) = self.0.as_mut() {
-            let _ = file.write_all(data.as_ref());
-            let _ = file.write_all(b"\n");
-        }
     }
 }
