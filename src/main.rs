@@ -1,16 +1,13 @@
 use acp_jcp::{NewSessionMeta, NewSessionRemote, RawIncomingMessage};
-use agent_client_protocol::{self as acp, ClientRequest, IncomingMessage, NewSessionRequest, Side};
 use agent_client_protocol::{
-    AgentSide, ClientCapabilities, ClientSide, FileSystemCapability, JsonRpcMessage,
-    OutgoingMessage, ProtocolVersion, Request, RequestId,
+    AgentSide, ClientRequest, ClientSide, JsonRpcMessage, NewSessionRequest, OutgoingMessage,
+    Request, RequestId, Side,
 };
 use dotenv::dotenv;
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{Map, Value};
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::Write;
-use std::{env, io};
+use serde_json::Value;
+use std::env;
+use std::{fs::File, io::Write};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, stdin, stdout};
 use tokio_tungstenite::connect_async;
 use tungstenite::{Message, Utf8Bytes, client::IntoClientRequest};
