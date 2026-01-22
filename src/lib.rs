@@ -7,12 +7,13 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
+    error::Error as StdError,
     fmt::Debug,
     io,
     pin::Pin,
     task::{Context, Poll},
 };
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader, Lines};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader, Lines};
 use tungstenite::{Message, Utf8Bytes};
 
 /// A Stream adapter that reads newline-delimited JSON from an async reader
@@ -49,7 +50,7 @@ pub struct StdoutSink<W> {
     written: usize,
 }
 
-impl<W: tokio::io::AsyncWrite + Unpin> StdoutSink<W> {
+impl<W: AsyncWrite + Unpin> StdoutSink<W> {
     pub fn new(writer: W) -> Self {
         Self {
             writer,
@@ -59,7 +60,7 @@ impl<W: tokio::io::AsyncWrite + Unpin> StdoutSink<W> {
     }
 }
 
-impl<W: tokio::io::AsyncWrite + Unpin> Sink<String> for StdoutSink<W> {
+impl<W: AsyncWrite + Unpin> Sink<String> for StdoutSink<W> {
     type Error = io::Error;
 
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -106,6 +107,52 @@ impl<W: tokio::io::AsyncWrite + Unpin> Sink<String> for StdoutSink<W> {
             other => other,
         }
     }
+}
+
+/// Adapts a WebSocket stream into String-based Stream and Sink.
+///
+/// Takes a split WebSocket stream and returns:
+/// - A `Stream<Item = Result<String, io::Error>>` for receiving text messages
+/// - A `Sink<String, Error = io::Error>` for sending text messages
+///
+/// Non-text WebSocket messages are filtered out from the receive stream.
+pub fn adapt_ws_stream<WsRx, WsTx>(
+    ws_rx: WsRx,
+    ws_tx: WsTx,
+) -> (
+    Pin<Box<dyn Stream<Item = Result<String, io::Error>> + Send>>,
+    Pin<Box<dyn Sink<String, Error = io::Error> + Send>>,
+)
+where
+    WsRx: Stream<Item = Result<Message, tungstenite::Error>> + Send + 'static,
+    WsTx: Sink<Message, Error = tungstenite::Error> + Send + 'static,
+{
+    let rx = Box::pin(ws_rx.filter_map(|msg| async move {
+        let result = match msg {
+            Ok(Message::Text(text)) => Ok(text.to_string()),
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::Other,
+                "Unexpected message type",
+            )),
+            Err(e) => Err(to_io_error(e)),
+        };
+        Some(result)
+    }));
+
+    let tx = Box::pin(
+        ws_tx
+            .sink_map_err(to_io_error)
+            .with(|s| async move { Ok(Message::Text(Utf8Bytes::from(s))) }),
+    );
+
+    (rx, tx)
+}
+
+fn to_io_error<E>(e: E) -> io::Error
+where
+    E: Into<Box<dyn StdError + Send + Sync>>,
+{
+    io::Error::new(io::ErrorKind::Other, e)
 }
 
 /// Configuration for the ACP-JCP adapter
@@ -184,8 +231,8 @@ pub async fn run_adapter<ClientRx, ClientTx, ServerRx, ServerTx>(
     ClientRx: Stream<Item = Result<String, io::Error>> + Unpin + Send + 'static,
     ClientTx: Sink<String> + Unpin + Send + 'static,
     ClientTx::Error: Debug,
-    ServerRx: Stream<Item = Result<Message, tungstenite::Error>> + Unpin + Send + 'static,
-    ServerTx: Sink<Message> + Unpin + Send + 'static,
+    ServerRx: Stream<Item = Result<String, io::Error>> + Unpin + Send + 'static,
+    ServerTx: Sink<String> + Unpin + Send + 'static,
     ServerTx::Error: Debug,
 {
     let new_session_meta = config.new_session_meta();
@@ -199,15 +246,12 @@ pub async fn run_adapter<ClientRx, ClientTx, ServerRx, ServerTx>(
 /// Server -> Client task: forwards messages from websocket to client
 pub async fn downlink_task<ServerRx, ClientTx>(mut server_rx: ServerRx, mut client_tx: ClientTx)
 where
-    ServerRx: Stream<Item = Result<Message, tungstenite::Error>> + Unpin,
+    ServerRx: Stream<Item = Result<String, io::Error>> + Unpin,
     ClientTx: Sink<String> + Unpin,
     ClientTx::Error: Debug,
 {
-    while let Some(msg) = server_rx.next().await {
-        if let Ok(msg) = msg {
-            let data = msg.into_text().unwrap().to_string();
-            client_tx.send(data).await.unwrap();
-        }
+    while let Some(Ok(msg)) = server_rx.next().await {
+        client_tx.send(msg).await.unwrap();
     }
 }
 
@@ -217,7 +261,7 @@ pub async fn uplink_task<ServerTx, ClientRx>(
     mut client_rx: ClientRx,
     new_session_meta: NewSessionMeta,
 ) where
-    ServerTx: Sink<Message> + Unpin,
+    ServerTx: Sink<String> + Unpin,
     ServerTx::Error: Debug,
     ClientRx: Stream<Item = Result<String, io::Error>> + Unpin,
 {
@@ -240,16 +284,10 @@ pub async fn uplink_task<ServerTx, ClientRx>(
 
             let json = serde_json::to_string(&msg).unwrap();
 
-            server_tx
-                .send(Message::Text(Utf8Bytes::from(&json)))
-                .await
-                .unwrap();
+            server_tx.send(json).await.unwrap();
         } else {
             // Sending notifications to JCP without modification
-            server_tx
-                .send(Message::Text(Utf8Bytes::from(msg)))
-                .await
-                .unwrap();
+            server_tx.send(msg).await.unwrap();
         }
     }
 }

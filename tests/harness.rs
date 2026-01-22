@@ -3,45 +3,70 @@
 //! Provides a clean API for testing the adapter without dealing with
 //! websocket setup, channels, and async coordination directly.
 
-use acp_jcp::{Config, RawIncomingMessage, StdinStream, StdoutSink, run_adapter};
+use acp_jcp::{Config, run_adapter};
 use agent_client_protocol::{
     AgentResponse, AgentSide, ClientRequest, ClientSide, JsonRpcMessage, OutgoingMessage, Request,
     RequestId, Response, Side,
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, StreamExt};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use std::net::SocketAddr;
 use std::time::Duration;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, DuplexStream},
-    net::TcpListener,
-    sync::mpsc,
-    task::JoinHandle,
-    time::timeout,
+use std::{
+    io,
+    pin::Pin,
+    task::{Context, Poll},
 };
-use tokio_tungstenite::accept_async;
-use tungstenite::{Message, Utf8Bytes};
+use tokio::{sync::mpsc, task::JoinHandle, time::timeout};
+use tokio_stream::wrappers::ReceiverStream;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// A Sink wrapper for mpsc::Sender<String>
+struct MpscSink {
+    tx: mpsc::Sender<String>,
+}
+
+impl Sink<String> for MpscSink {
+    type Error = mpsc::error::SendError<String>;
+
+    fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        // For bounded channels with enough capacity, we assume ready
+        Poll::Ready(Ok(()))
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: String) -> Result<(), Self::Error> {
+        self.get_mut().tx.try_send(item).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(s) | mpsc::error::TrySendError::Closed(s) => {
+                mpsc::error::SendError(s)
+            }
+        })
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+}
 
 /// Test harness for the ACP-JCP adapter.
 ///
 /// Provides a clean API for sending messages from the client side,
 /// receiving them on the server side, and vice versa.
 pub struct AdapterTestHarness {
-    /// Send messages to the mock server (which then sends to adapter)
-    to_adapter_tx: mpsc::Sender<String>,
-    /// Receive messages that adapter sent to mock server
-    from_adapter_rx: mpsc::Receiver<String>,
-    /// Write to this to simulate client stdin
-    client_stdin: DuplexStream,
-    /// Read from this to get client stdout
-    client_stdout: DuplexStream,
+    /// Send messages to adapter (from server side)
+    to_adapter_server_tx: mpsc::Sender<String>,
+    /// Receive messages from adapter (server side)
+    from_adapter_server_rx: mpsc::Receiver<String>,
+    /// Send messages to adapter (from client side, simulating stdin)
+    to_adapter_client_tx: mpsc::Sender<String>,
+    /// Receive messages from adapter (client side, simulating stdout)
+    from_adapter_client_rx: mpsc::Receiver<String>,
     /// Handle to wait for adapter shutdown
     adapter_handle: JoinHandle<()>,
-    /// Handle to wait for mock server shutdown
-    server_handle: JoinHandle<()>,
     /// Next request ID for client requests
     next_request_id: u32,
 }
@@ -49,41 +74,36 @@ pub struct AdapterTestHarness {
 impl AdapterTestHarness {
     /// Bootstrap a new test harness with the given config.
     pub async fn new(config: Config) -> Self {
-        // Channels for test harness <-> mock server communication
-        let (to_adapter_tx, to_adapter_rx) = mpsc::channel::<String>(10);
-        let (from_adapter_tx, from_adapter_rx) = mpsc::channel::<String>(10);
+        // Channels for test harness <-> adapter server side communication
+        let (to_adapter_server_tx, to_adapter_server_rx) = mpsc::channel::<String>(10);
+        let (from_adapter_server_tx, from_adapter_server_rx) = mpsc::channel::<String>(10);
 
-        // Start mock websocket server
-        let (addr, server_handle) = start_mock_ws_server(to_adapter_rx, from_adapter_tx).await;
+        // Channels for test harness <-> adapter client side communication
+        let (to_adapter_client_tx, to_adapter_client_rx) = mpsc::channel::<String>(10);
+        let (from_adapter_client_tx, from_adapter_client_rx) = mpsc::channel::<String>(10);
 
-        // Create client side channels (simulating stdin/stdout)
-        let (client_stdin, client_stdin_rx) = tokio::io::duplex(4096);
-        let (client_stdout_tx, client_stdout) = tokio::io::duplex(4096);
+        // Convert mpsc channels to Stream/Sink for the adapter
+        let client_rx = ReceiverStream::new(to_adapter_client_rx).map(Ok::<_, io::Error>);
+        let client_tx = MpscSink {
+            tx: from_adapter_client_tx,
+        };
 
-        // Connect adapter to mock server
-        let ws_url = format!("ws://{}", addr);
-        let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
-        let (server_tx, server_rx) = ws_stream.split();
+        let server_rx = ReceiverStream::new(to_adapter_server_rx).map(Ok::<_, io::Error>);
+        let server_tx = MpscSink {
+            tx: from_adapter_server_tx,
+        };
 
         // Spawn the adapter
         let adapter_handle = tokio::spawn(async move {
-            run_adapter(
-                config,
-                StdinStream::new(client_stdin_rx),
-                StdoutSink::new(client_stdout_tx),
-                server_rx,
-                server_tx,
-            )
-            .await;
+            run_adapter(config, client_rx, client_tx, server_rx, server_tx).await;
         });
 
         Self {
-            to_adapter_tx,
-            from_adapter_rx,
-            client_stdin,
-            client_stdout,
+            to_adapter_server_tx,
+            from_adapter_server_rx,
+            to_adapter_client_tx,
+            from_adapter_client_rx,
             adapter_handle,
-            server_handle,
             next_request_id: 1,
         }
     }
@@ -104,10 +124,7 @@ impl AdapterTestHarness {
             }));
 
         let json = serde_json::to_string(&msg).unwrap();
-        self.client_stdin
-            .write_all(format!("{}\n", json).as_bytes())
-            .await
-            .unwrap();
+        self.to_adapter_client_tx.send(json).await.unwrap();
 
         id
     }
@@ -117,8 +134,8 @@ impl AdapterTestHarness {
     /// Useful for testing edge cases or notifications.
     #[allow(dead_code)]
     pub async fn client_send_raw(&mut self, json: &str) {
-        self.client_stdin
-            .write_all(format!("{}\n", json).as_bytes())
+        self.to_adapter_client_tx
+            .send(json.to_string())
             .await
             .unwrap();
     }
@@ -127,7 +144,7 @@ impl AdapterTestHarness {
     ///
     /// Returns the raw JSON value for flexible assertions.
     pub async fn server_recv(&mut self) -> Value {
-        let msg = timeout(DEFAULT_TIMEOUT, self.from_adapter_rx.recv())
+        let msg = timeout(DEFAULT_TIMEOUT, self.from_adapter_server_rx.recv())
             .await
             .expect("timeout waiting for server to receive message")
             .expect("channel closed");
@@ -166,86 +183,34 @@ impl AdapterTestHarness {
         ));
 
         let json = serde_json::to_string(&msg).unwrap();
-        self.to_adapter_tx.send(json).await.unwrap();
+        self.to_adapter_server_tx.send(json).await.unwrap();
     }
 
     /// Send a raw JSON response from the server.
     #[allow(dead_code)]
     pub async fn server_reply_raw(&mut self, json: &str) {
-        self.to_adapter_tx.send(json.to_string()).await.unwrap();
+        self.to_adapter_server_tx
+            .send(json.to_string())
+            .await
+            .unwrap();
     }
 
     /// Receive a response that the adapter forwarded to the client.
     ///
-    /// Returns the raw JSON value for flexible assertions.
+    /// Returns the parsed response for assertions.
     pub async fn client_recv<T: DeserializeOwned>(&mut self) -> Response<T> {
-        let mut buf = vec![0u8; 4096];
-        let n = timeout(DEFAULT_TIMEOUT, self.client_stdout.read(&mut buf))
+        let msg = timeout(DEFAULT_TIMEOUT, self.from_adapter_client_rx.recv())
             .await
             .expect("timeout waiting for client to receive message")
-            .expect("read error");
+            .expect("channel closed");
 
-        let response = String::from_utf8_lossy(&buf[..n]);
-        serde_json::from_str(&response).expect("invalid JSON response")
+        serde_json::from_str(&msg).expect("invalid JSON response")
     }
 
     /// Shutdown the test harness gracefully.
     pub async fn shutdown(self) {
-        drop(self.client_stdin);
-        drop(self.to_adapter_tx);
+        drop(self.to_adapter_client_tx);
+        drop(self.to_adapter_server_tx);
         let _ = timeout(Duration::from_millis(100), self.adapter_handle).await;
-        let _ = timeout(Duration::from_millis(100), self.server_handle).await;
     }
-}
-
-/// Start a mock websocket server.
-/// Returns the address and a JoinHandle for proper shutdown.
-async fn start_mock_ws_server(
-    to_client_rx: mpsc::Receiver<String>,
-    from_client_tx: mpsc::Sender<String>,
-) -> (SocketAddr, JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-
-    let handle = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let ws_stream = accept_async(stream).await.unwrap();
-        let (ws_tx, ws_rx) = ws_stream.split();
-
-        // Adapt websocket to String streams/sinks
-        let ws_rx_strings = ws_rx.filter_map(|msg| async move {
-            match msg {
-                Ok(Message::Text(text)) => Some(text.to_string()),
-                _ => None,
-            }
-        });
-        let ws_tx_strings = ws_tx.with(|s: String| async move {
-            Ok::<_, tungstenite::Error>(Message::Text(Utf8Bytes::from(s)))
-        });
-
-        // Server receives from websocket and sends to test harness
-        let receive_handle = tokio::spawn(async move {
-            let mut ws_rx_strings = std::pin::pin!(ws_rx_strings);
-            while let Some(msg) = ws_rx_strings.next().await {
-                if from_client_tx.send(msg).await.is_err() {
-                    break;
-                }
-            }
-        });
-
-        // Server receives from test harness and sends to websocket
-        let send_handle = tokio::spawn(async move {
-            let mut to_client_rx = to_client_rx;
-            let mut ws_tx_strings = std::pin::pin!(ws_tx_strings);
-            while let Some(msg) = to_client_rx.recv().await {
-                if ws_tx_strings.send(msg).await.is_err() {
-                    break;
-                }
-            }
-        });
-
-        let _ = tokio::join!(receive_handle, send_handle);
-    });
-
-    (addr, handle)
 }
