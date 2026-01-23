@@ -5,7 +5,7 @@ use agent_client_protocol::{
 use futures::{Sink, Stream};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::Value as JsonValue;
 use std::io;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, Lines};
 use tungstenite::{Message, Utf8Bytes};
@@ -20,10 +20,10 @@ pub trait Transport {
     /// Returns `Ok(None)` when the transport is closed.
     ///
     /// All implementations need to by cancel safe
-    async fn recv(&mut self) -> io::Result<Option<Value>>;
+    async fn recv(&mut self) -> io::Result<Option<JsonValue>>;
 
     /// Send a message through the transport.
-    async fn send(&mut self, msg: Value) -> io::Result<()>;
+    async fn send(&mut self, msg: JsonValue) -> io::Result<()>;
 }
 
 /// Transport implementation for arbitrary async readers/writers.
@@ -48,7 +48,7 @@ impl IoTransport {
 }
 
 impl Transport for IoTransport {
-    async fn recv(&mut self) -> io::Result<Option<Value>> {
+    async fn recv(&mut self) -> io::Result<Option<JsonValue>> {
         // Lines::next_line() is cancellation safe per tokio documentation
         match self.lines.next_line().await? {
             Some(line) => {
@@ -61,7 +61,7 @@ impl Transport for IoTransport {
         }
     }
 
-    async fn send(&mut self, msg: Value) -> io::Result<()> {
+    async fn send(&mut self, msg: JsonValue) -> io::Result<()> {
         let json = serde_json::to_string(&msg)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         self.writer.write_all(json.as_bytes()).await?;
@@ -89,7 +89,7 @@ impl WebSocketTransport {
 }
 
 impl Transport for WebSocketTransport {
-    async fn recv(&mut self) -> io::Result<Option<Value>> {
+    async fn recv(&mut self) -> io::Result<Option<JsonValue>> {
         match self.rx.next().await {
             Some(Ok(Message::Text(text))) => serde_json::from_str(&text)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
@@ -103,7 +103,7 @@ impl Transport for WebSocketTransport {
         }
     }
 
-    async fn send(&mut self, msg: Value) -> io::Result<()> {
+    async fn send(&mut self, msg: JsonValue) -> io::Result<()> {
         let message = serde_json::to_string(&msg)
             .map_err(to_io_invalid_data_err)
             .map(Utf8Bytes::from)
@@ -214,7 +214,7 @@ where
     }
 
     /// Handle a message from the client (uplink: client -> server)
-    async fn handle_client_message(&mut self, msg: Value) -> io::Result<()> {
+    async fn handle_client_message(&mut self, msg: JsonValue) -> io::Result<()> {
         // This is ungly hack, but we need to serialize here back to string, otherwise
         // we can not use AgentSide::decode_request()
         let msg_str = msg.to_string();
@@ -254,7 +254,7 @@ where
 
 /// JCP needs to know where to clone git repo from and what branch to use
 fn inject_new_session_meta(req: &mut NewSessionRequest, meta: &NewSessionMeta) -> io::Result<()> {
-    if let Value::Object(json) = serde_json::to_value(meta).map_err(to_io_invalid_data_err)? {
+    if let JsonValue::Object(json) = serde_json::to_value(meta).map_err(to_io_invalid_data_err)? {
         req.meta = Some(json);
     }
     Ok(())
