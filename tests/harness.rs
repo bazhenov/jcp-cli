@@ -12,13 +12,13 @@ use agent_client_protocol::{
     RequestId, Response, Side,
 };
 use serde::de::DeserializeOwned;
-use serde_json::Value;
+use serde_json::{Value, value::RawValue};
 use std::io;
 use tokio::sync::mpsc;
 
 /// Test harness for the ACP-JCP adapter.
 ///
-/// Provides a clean API for sending messages from the client side,
+/// Provides an API for sending messages from the client side,
 /// receiving them on the server side, and vice versa.
 ///
 /// The adapter is driven synchronously via `step()`, making tests
@@ -53,7 +53,7 @@ impl TestHarness {
     /// Process the next message in the adapter.
     ///
     /// Returns `Some(())` if a message was processed, `None` if channels are closed.
-    pub async fn step(&mut self) -> Option<()> {
+    pub async fn step(&mut self) -> io::Result<Option<()>> {
         self.adapter.handle_next_message().await
     }
 
@@ -116,7 +116,7 @@ impl TestHarness {
         let request = AgentSide::decode_request(
             method,
             params
-                .map(|p| serde_json::value::RawValue::from_string(p.to_string()).unwrap())
+                .map(|p| RawValue::from_string(p.to_string()).unwrap())
                 .as_deref(),
         )
         .expect("failed to decode request");

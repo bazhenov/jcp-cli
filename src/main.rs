@@ -42,5 +42,10 @@ async fn main() {
     let uplink = WebSocketTransport::new(ws_rx, ws_tx);
 
     let mut adapter = Adapter::new(config, downlink, uplink);
-    while adapter.handle_next_message().await.is_some() {}
+    while adapter
+        .handle_next_message()
+        .await
+        .expect("Unable to handle message")
+        .is_some()
+    {}
 }

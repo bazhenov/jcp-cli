@@ -7,7 +7,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, Lines};
 use tungstenite::{Message, Utf8Bytes};
 
 /// A bidirectional transport for JSON-RPC messages.
@@ -18,6 +18,8 @@ use tungstenite::{Message, Utf8Bytes};
 pub trait Transport {
     /// Receive the next message from the transport.
     /// Returns `Ok(None)` when the transport is closed.
+    ///
+    /// All implementations need to by cancel safe
     async fn recv(&mut self) -> io::Result<Option<Value>>;
 
     /// Send a message through the transport.
@@ -28,7 +30,7 @@ pub trait Transport {
 ///
 /// Reads newline-delimited JSON from reader and writes newline-delimited JSON to writer.
 pub struct IoTransport {
-    reader: BufReader<Box<dyn AsyncRead + Unpin + Send>>,
+    lines: Lines<BufReader<Box<dyn AsyncRead + Unpin + Send>>>,
     writer: Box<dyn AsyncWrite + Unpin + Send>,
 }
 
@@ -37,8 +39,9 @@ impl IoTransport {
         reader: impl AsyncRead + Unpin + Send + 'static,
         writer: impl AsyncWrite + Unpin + Send + 'static,
     ) -> Self {
+        let reader: Box<dyn AsyncRead + Unpin + Send> = Box::new(reader);
         Self {
-            reader: BufReader::new(Box::new(reader)),
+            lines: BufReader::new(reader).lines(),
             writer: Box::new(writer),
         }
     }
@@ -46,18 +49,15 @@ impl IoTransport {
 
 impl Transport for IoTransport {
     async fn recv(&mut self) -> io::Result<Option<Value>> {
-        let mut line = String::new();
-        match self.reader.read_line(&mut line).await? {
-            0 => Ok(None), // EOF
-            _ => {
-                // Remove trailing newline
-                if line.ends_with('\n') {
-                    line.pop();
-                }
-                let value = serde_json::from_str(&line)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                Ok(Some(value))
+        // Lines::next_line() is cancellation safe per tokio documentation
+        match self.lines.next_line().await? {
+            Some(line) => {
+                println!("Line: {line}");
+                serde_json::from_str(&line)
+                    .map_err(to_io_invalid_data_err)
+                    .map(Some)
             }
+            None => Ok(None),
         }
     }
 
@@ -90,27 +90,25 @@ impl WebSocketTransport {
 
 impl Transport for WebSocketTransport {
     async fn recv(&mut self) -> io::Result<Option<Value>> {
-        loop {
-            match self.rx.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let value = serde_json::from_str(&text)
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                    return Ok(Some(value));
-                }
-                Some(Ok(_)) => continue, // Skip non-text messages
-                Some(Err(e)) => return Err(io::Error::other(e)),
-                None => return Ok(None),
-            }
+        match self.rx.next().await {
+            Some(Ok(Message::Text(text))) => serde_json::from_str(&text)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+                .map(Some),
+            Some(Ok(_)) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Only text messages are supported",
+            )),
+            Some(Err(e)) => Err(io::Error::other(e)),
+            None => Ok(None),
         }
     }
 
     async fn send(&mut self, msg: Value) -> io::Result<()> {
-        let json = serde_json::to_string(&msg)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        self.tx
-            .send(Message::Text(Utf8Bytes::from(json)))
-            .await
-            .map_err(io::Error::other)
+        let message = serde_json::to_string(&msg)
+            .map_err(to_io_invalid_data_err)
+            .map(Utf8Bytes::from)
+            .map(Message::Text)?;
+        self.tx.send(message).await.map_err(io::Error::other)
     }
 }
 
@@ -202,31 +200,33 @@ where
     ///
     /// Returns `Some(())` when a message was processed successfully.
     /// Returns `None` when both channels are closed (end of communication).
-    pub async fn handle_next_message(&mut self) -> Option<()> {
+    pub async fn handle_next_message(&mut self) -> io::Result<Option<()>> {
         tokio::select! {
             Ok(Some(msg)) = self.downlink.recv() => {
-                self.handle_client_message(msg).await;
+                self.handle_client_message(msg).await?;
             }
             Ok(Some(msg)) = self.uplink.recv() => {
-                self.handle_server_message(msg).await;
+                self.downlink.send(msg).await?;
             }
-            else => return None,
+            else => return Ok(None),
         }
-        Some(())
+        Ok(Some(()))
     }
 
     /// Handle a message from the client (uplink: client -> server)
-    async fn handle_client_message(&mut self, msg: Value) {
+    async fn handle_client_message(&mut self, msg: Value) -> io::Result<()> {
         // This is ungly hack, but we need to serialize here back to string, otherwise
         // we can not use AgentSide::decode_request()
         let msg_str = msg.to_string();
-        let rpc_msg: RawIncomingMessage<'_> = serde_json::from_str(&msg_str).unwrap();
+        let rpc_msg: RawIncomingMessage<'_> =
+            serde_json::from_str(&msg_str).map_err(to_io_invalid_data_err)?;
 
         if let Some((method, id)) = rpc_msg.method.zip(rpc_msg.id) {
-            let mut request = AgentSide::decode_request(method, rpc_msg.params).unwrap();
+            let mut request = AgentSide::decode_request(method, rpc_msg.params)
+                .map_err(to_io_invalid_data_err)?;
 
             if let ClientRequest::NewSessionRequest(r) = &mut request {
-                inject_new_session_meta(r, &self.new_session_meta);
+                inject_new_session_meta(r, &self.new_session_meta)?;
             }
 
             let msg =
@@ -236,39 +236,43 @@ where
                     params: Some(request),
                 }));
 
-            let value = serde_json::to_value(&msg).unwrap();
-            let _ = self.uplink.send(value).await;
+            let value = serde_json::to_value(&msg).map_err(to_io_invalid_data_err)?;
+            self.uplink.send(value).await?;
         } else {
             // Sending notifications to JCP without modification
-            let _ = self.uplink.send(msg).await;
+            self.uplink.send(msg).await?;
         }
-    }
-
-    /// Handle a message from the server (downlink: server -> client)
-    async fn handle_server_message(&mut self, msg: Value) {
-        let _ = self.downlink.send(msg).await;
+        Ok(())
     }
 
     /// Run the adapter until both channels are closed.
-    pub async fn run(&mut self) {
-        while self.handle_next_message().await.is_some() {}
+    pub async fn run(&mut self) -> io::Result<()> {
+        while self.handle_next_message().await?.is_some() {}
+        Ok(())
     }
 }
 
 /// JCP needs to know where to clone git repo from and what branch to use
-fn inject_new_session_meta(req: &mut NewSessionRequest, meta: &NewSessionMeta) {
-    if let Value::Object(json) = serde_json::to_value(meta).unwrap() {
+fn inject_new_session_meta(req: &mut NewSessionRequest, meta: &NewSessionMeta) -> io::Result<()> {
+    if let Value::Object(json) = serde_json::to_value(meta).map_err(to_io_invalid_data_err)? {
         req.meta = Some(json);
     }
+    Ok(())
+}
+
+fn to_io_invalid_data_err<E: Into<Box<dyn std::error::Error + Send + Sync>>>(e: E) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, e)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use agent_client_protocol::{AgentSide, ClientRequest, Side};
+    use drop_check::{IntersperceExt, cancelations};
     use serde::de::DeserializeOwned;
     use serde_json::Value;
     use std::fmt::Debug;
+    use std::io::Cursor;
 
     #[test]
     fn test_new_session_meta_deserialization() {
@@ -332,5 +336,26 @@ mod tests {
         assert_eq!(deserialized, expected_value);
         let serialized = serde_json::to_value(deserialized).unwrap();
         assert_eq!(json, serialized);
+    }
+
+    #[test]
+    fn io_transport_recv_is_cancel_safe() {
+        use drop_check::BoxFuture;
+
+        let json_line = b"{\"key\":\"value\"}\n";
+        let expected: Value = serde_json::from_slice(json_line).unwrap();
+
+        let init = || {
+            let reader = Cursor::new(json_line.to_vec()).intersperse_pending();
+            IoTransport::new(reader, vec![])
+        };
+
+        fn recv(transport: &mut IoTransport) -> BoxFuture<'_, io::Result<Option<Value>>> {
+            Box::pin(transport.recv())
+        }
+
+        for (_, result) in cancelations(init, recv) {
+            assert_eq!(result.unwrap(), Some(expected.clone()));
+        }
     }
 }
