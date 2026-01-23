@@ -2,8 +2,11 @@
 //!
 //! Provides a clean API for testing the adapter without dealing with
 //! websocket setup, channels, and async coordination directly.
+//!
+//! The harness drives the adapter synchronously via `step()`, eliminating
+//! the need for timeouts and making tests deterministic.
 
-use acp_jcp::{Config, run_adapter};
+use acp_jcp::{Adapter, Config};
 use agent_client_protocol::{
     AgentResponse, AgentSide, ClientRequest, ClientSide, JsonRpcMessage, OutgoingMessage, Request,
     RequestId, Response, Side,
@@ -11,16 +14,13 @@ use agent_client_protocol::{
 use futures_util::{Sink, StreamExt};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use std::time::Duration;
 use std::{
     io,
     pin::Pin,
     task::{Context, Poll},
 };
-use tokio::{sync::mpsc, task::JoinHandle, time::timeout};
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A Sink wrapper for mpsc::Sender<String>
 struct MpscSink {
@@ -31,7 +31,6 @@ impl Sink<String> for MpscSink {
     type Error = mpsc::error::SendError<String>;
 
     fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        // For bounded channels with enough capacity, we assume ready
         Poll::Ready(Ok(()))
     }
 
@@ -52,11 +51,23 @@ impl Sink<String> for MpscSink {
     }
 }
 
+type TestAdapter = Adapter<
+    futures_util::stream::Map<ReceiverStream<String>, fn(String) -> Result<String, io::Error>>,
+    MpscSink,
+    futures_util::stream::Map<ReceiverStream<String>, fn(String) -> Result<String, io::Error>>,
+    MpscSink,
+>;
+
 /// Test harness for the ACP-JCP adapter.
 ///
 /// Provides a clean API for sending messages from the client side,
 /// receiving them on the server side, and vice versa.
+///
+/// The adapter is driven synchronously via `step()`, making tests
+/// deterministic without timeouts.
 pub struct AdapterTestHarness {
+    /// The adapter instance
+    adapter: TestAdapter,
     /// Send messages to adapter (from server side)
     to_adapter_server_tx: mpsc::Sender<String>,
     /// Receive messages from adapter (server side)
@@ -65,15 +76,13 @@ pub struct AdapterTestHarness {
     to_adapter_client_tx: mpsc::Sender<String>,
     /// Receive messages from adapter (client side, simulating stdout)
     from_adapter_client_rx: mpsc::Receiver<String>,
-    /// Handle to wait for adapter shutdown
-    adapter_handle: JoinHandle<()>,
     /// Next request ID for client requests
     next_request_id: u32,
 }
 
 impl AdapterTestHarness {
     /// Bootstrap a new test harness with the given config.
-    pub async fn new(config: Config) -> Self {
+    pub fn new(config: Config) -> Self {
         // Channels for test harness <-> adapter server side communication
         let (to_adapter_server_tx, to_adapter_server_rx) = mpsc::channel::<String>(10);
         let (from_adapter_server_tx, from_adapter_server_rx) = mpsc::channel::<String>(10);
@@ -83,34 +92,41 @@ impl AdapterTestHarness {
         let (from_adapter_client_tx, from_adapter_client_rx) = mpsc::channel::<String>(10);
 
         // Convert mpsc channels to Stream/Sink for the adapter
-        let client_rx = ReceiverStream::new(to_adapter_client_rx).map(Ok::<_, io::Error>);
+        let client_rx =
+            ReceiverStream::new(to_adapter_client_rx).map(Ok::<_, io::Error> as fn(_) -> _);
         let client_tx = MpscSink {
             tx: from_adapter_client_tx,
         };
 
-        let server_rx = ReceiverStream::new(to_adapter_server_rx).map(Ok::<_, io::Error>);
+        let server_rx =
+            ReceiverStream::new(to_adapter_server_rx).map(Ok::<_, io::Error> as fn(_) -> _);
         let server_tx = MpscSink {
             tx: from_adapter_server_tx,
         };
 
-        // Spawn the adapter
-        let adapter_handle = tokio::spawn(async move {
-            run_adapter(config, client_rx, client_tx, server_rx, server_tx).await;
-        });
+        let adapter = Adapter::new(config, client_rx, client_tx, server_rx, server_tx);
 
         Self {
+            adapter,
             to_adapter_server_tx,
             from_adapter_server_rx,
             to_adapter_client_tx,
             from_adapter_client_rx,
-            adapter_handle,
             next_request_id: 1,
         }
+    }
+
+    /// Process the next message in the adapter.
+    ///
+    /// Returns `Some(())` if a message was processed, `None` if channels are closed.
+    pub async fn step(&mut self) -> Option<()> {
+        self.adapter.handle_next_message().await
     }
 
     /// Send a request from the client to the adapter.
     ///
     /// This simulates a client (IDE) sending a JSON-RPC request via stdin.
+    /// Note: Call `step()` after this to process the message.
     pub async fn client_send(&mut self, request: ClientRequest) -> RequestId {
         let id = RequestId::Number(self.next_request_id as i64);
         self.next_request_id += 1;
@@ -132,6 +148,7 @@ impl AdapterTestHarness {
     /// Send a raw JSON-RPC message from the client.
     ///
     /// Useful for testing edge cases or notifications.
+    /// Note: Call `step()` after this to process the message.
     #[allow(dead_code)]
     pub async fn client_send_raw(&mut self, json: &str) {
         self.to_adapter_client_tx
@@ -143,18 +160,21 @@ impl AdapterTestHarness {
     /// Receive a request that the adapter forwarded to the server.
     ///
     /// Returns the raw JSON value for flexible assertions.
-    pub async fn server_recv(&mut self) -> Value {
-        let msg = timeout(DEFAULT_TIMEOUT, self.from_adapter_server_rx.recv())
-            .await
-            .expect("timeout waiting for server to receive message")
-            .expect("channel closed");
+    /// Note: Call `step()` before this to ensure the message has been processed.
+    pub fn server_recv(&mut self) -> Value {
+        let msg = self
+            .from_adapter_server_rx
+            .try_recv()
+            .expect("no message available from server");
 
         serde_json::from_str(&msg).expect("invalid JSON from adapter")
     }
 
     /// Receive a request that the adapter forwarded to the server, parsed as ClientRequest.
-    pub async fn server_recv_request(&mut self) -> (RequestId, ClientRequest) {
-        let value = self.server_recv().await;
+    ///
+    /// Note: Call `step()` before this to ensure the message has been processed.
+    pub fn server_recv_request(&mut self) -> (RequestId, ClientRequest) {
+        let value = self.server_recv();
 
         let id = match &value["id"] {
             Value::Number(n) => RequestId::Number(n.as_i64().unwrap()),
@@ -177,6 +197,8 @@ impl AdapterTestHarness {
     }
 
     /// Send a response from the server back to the adapter.
+    ///
+    /// Note: Call `step()` after this to process the response.
     pub async fn server_reply(&mut self, id: RequestId, response: AgentResponse) {
         let msg = JsonRpcMessage::wrap(OutgoingMessage::Response::<AgentSide, ClientSide>(
             Response::new(id, Ok::<_, agent_client_protocol::Error>(response)),
@@ -187,6 +209,8 @@ impl AdapterTestHarness {
     }
 
     /// Send a raw JSON response from the server.
+    ///
+    /// Note: Call `step()` after this to process the response.
     #[allow(dead_code)]
     pub async fn server_reply_raw(&mut self, json: &str) {
         self.to_adapter_server_tx
@@ -198,19 +222,13 @@ impl AdapterTestHarness {
     /// Receive a response that the adapter forwarded to the client.
     ///
     /// Returns the parsed response for assertions.
-    pub async fn client_recv<T: DeserializeOwned>(&mut self) -> Response<T> {
-        let msg = timeout(DEFAULT_TIMEOUT, self.from_adapter_client_rx.recv())
-            .await
-            .expect("timeout waiting for client to receive message")
-            .expect("channel closed");
+    /// Note: Call `step()` before this to ensure the response has been processed.
+    pub fn client_recv<T: DeserializeOwned>(&mut self) -> Response<T> {
+        let msg = self
+            .from_adapter_client_rx
+            .try_recv()
+            .expect("no message available for client");
 
         serde_json::from_str(&msg).expect("invalid JSON response")
-    }
-
-    /// Shutdown the test harness gracefully.
-    pub async fn shutdown(self) {
-        drop(self.to_adapter_client_tx);
-        drop(self.to_adapter_server_tx);
-        let _ = timeout(Duration::from_millis(100), self.adapter_handle).await;
     }
 }

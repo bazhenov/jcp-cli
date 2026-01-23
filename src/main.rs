@@ -1,4 +1,4 @@
-use acp_jcp::{adapt_ws_stream, run_adapter, Config, StdinStream, StdoutSink};
+use acp_jcp::{Adapter, Config, StdinStream, StdoutSink, adapt_ws_stream};
 use dotenv::dotenv;
 use futures_util::StreamExt;
 use std::env;
@@ -42,5 +42,6 @@ async fn main() {
     let client_rx = StdinStream::new(stdin());
     let client_tx = StdoutSink::new(stdout());
 
-    run_adapter(config, client_rx, client_tx, server_rx, server_tx).await;
+    let mut adapter = Adapter::new(config, client_rx, client_tx, server_rx, server_tx);
+    while adapter.handle_next_message().await.is_some() {}
 }

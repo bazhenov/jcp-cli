@@ -212,67 +212,70 @@ pub struct RawIncomingMessage<'a> {
     pub error: Option<acp::Error>,
 }
 
-/// Run the adapter connecting client streams to server streams
+/// Adapter that bridges ACP client and JCP server communication.
 ///
-/// This function bridges:
-/// - `client_rx`: incoming string messages from the client (e.g., stdin lines)
-/// - `client_tx`: outgoing string messages to the client (e.g., stdout)
-/// - `server_rx`: incoming messages from the websocket server
-/// - `server_tx`: outgoing messages to the websocket server
-///
-/// Framing (newline delimiting) should be handled by the stream/sink implementations.
-pub async fn run_adapter<ClientRx, ClientTx, ServerRx, ServerTx>(
-    config: Config,
+/// This struct processes messages from both channels using `tokio::select!`,
+/// allowing for synchronous test-driving without spawning separate tasks.
+pub struct Adapter<ClientRx, ClientTx, ServerRx, ServerTx> {
+    new_session_meta: NewSessionMeta,
     client_rx: ClientRx,
     client_tx: ClientTx,
     server_rx: ServerRx,
     server_tx: ServerTx,
-) where
-    ClientRx: Stream<Item = Result<String, io::Error>> + Unpin + Send + 'static,
-    ClientTx: Sink<String> + Unpin + Send + 'static,
-    ClientTx::Error: Debug,
-    ServerRx: Stream<Item = Result<String, io::Error>> + Unpin + Send + 'static,
-    ServerTx: Sink<String> + Unpin + Send + 'static,
-    ServerTx::Error: Debug,
-{
-    let new_session_meta = config.new_session_meta();
-
-    let uplink = tokio::spawn(uplink_task(server_tx, client_rx, new_session_meta));
-    let downlink = tokio::spawn(downlink_task(server_rx, client_tx));
-
-    let _ = tokio::join!(uplink, downlink);
 }
 
-/// Server -> Client task: forwards messages from websocket to client
-pub async fn downlink_task<ServerRx, ClientTx>(mut server_rx: ServerRx, mut client_tx: ClientTx)
+impl<ClientRx, ClientTx, ServerRx, ServerTx> Adapter<ClientRx, ClientTx, ServerRx, ServerTx>
 where
-    ServerRx: Stream<Item = Result<String, io::Error>> + Unpin,
+    ClientRx: Stream<Item = Result<String, io::Error>> + Unpin,
     ClientTx: Sink<String> + Unpin,
     ClientTx::Error: Debug,
-{
-    while let Some(Ok(msg)) = server_rx.next().await {
-        client_tx.send(msg).await.unwrap();
-    }
-}
-
-/// Client -> Server task: forwards messages from client to websocket
-pub async fn uplink_task<ServerTx, ClientRx>(
-    mut server_tx: ServerTx,
-    mut client_rx: ClientRx,
-    new_session_meta: NewSessionMeta,
-) where
+    ServerRx: Stream<Item = Result<String, io::Error>> + Unpin,
     ServerTx: Sink<String> + Unpin,
     ServerTx::Error: Debug,
-    ClientRx: Stream<Item = Result<String, io::Error>> + Unpin,
 {
-    while let Some(Ok(msg)) = client_rx.next().await {
+    /// Create a new adapter with the given configuration and transport streams.
+    pub fn new(
+        config: Config,
+        client_rx: ClientRx,
+        client_tx: ClientTx,
+        server_rx: ServerRx,
+        server_tx: ServerTx,
+    ) -> Self {
+        Self {
+            new_session_meta: config.new_session_meta(),
+            client_rx,
+            client_tx,
+            server_rx,
+            server_tx,
+        }
+    }
+
+    /// Process the next message from either the client or server channel.
+    ///
+    /// Returns `Some(())` when a message was processed successfully.
+    /// Returns `None` when both channels are closed (end of communication).
+    pub async fn handle_next_message(&mut self) -> Option<()> {
+        tokio::select! {
+            Some(Ok(msg)) = self.client_rx.next() => {
+                self.handle_client_message(msg).await;
+            }
+            Some(Ok(msg)) = self.server_rx.next() => {
+                self.handle_server_message(msg).await;
+            }
+            else => return None,
+        }
+        Some(())
+    }
+
+    /// Handle a message from the client (uplink: client -> server)
+    async fn handle_client_message(&mut self, msg: String) {
         let rpc_msg: RawIncomingMessage<'_> = serde_json::from_slice(msg.as_bytes()).unwrap();
 
         if let Some((method, id)) = rpc_msg.method.zip(rpc_msg.id) {
             let mut request = AgentSide::decode_request(method, rpc_msg.params).unwrap();
 
             if let ClientRequest::NewSessionRequest(r) = &mut request {
-                inject_new_session_meta(r, &new_session_meta);
+                inject_new_session_meta(r, &self.new_session_meta);
             }
 
             let msg =
@@ -283,12 +286,21 @@ pub async fn uplink_task<ServerTx, ClientRx>(
                 }));
 
             let json = serde_json::to_string(&msg).unwrap();
-
-            server_tx.send(json).await.unwrap();
+            self.server_tx.send(json).await.unwrap();
         } else {
             // Sending notifications to JCP without modification
-            server_tx.send(msg).await.unwrap();
+            self.server_tx.send(msg).await.unwrap();
         }
+    }
+
+    /// Handle a message from the server (downlink: server -> client)
+    async fn handle_server_message(&mut self, msg: String) {
+        self.client_tx.send(msg).await.unwrap();
+    }
+
+    /// Run the adapter until both channels are closed.
+    pub async fn run(&mut self) {
+        while self.handle_next_message().await.is_some() {}
     }
 }
 

@@ -24,14 +24,17 @@ fn test_config() -> Config {
 
 #[tokio::test]
 async fn test_adapter_forwards_initialize_request_to_server() {
-    let mut harness = AdapterTestHarness::new(test_config()).await;
+    let mut harness = AdapterTestHarness::new(test_config());
 
     // Client sends initialize request
     let request = ClientRequest::InitializeRequest(InitializeRequest::new(1.into()));
     let request_id = harness.client_send(request).await;
 
-    // Server receives the forwarded request
-    let (recv_id, recv_request) = harness.server_recv_request().await;
+    // Process the client message
+    harness.step().await;
+
+    // Server receives the forwarded request (no timeout needed)
+    let (recv_id, recv_request) = harness.server_recv_request();
     assert_eq!(recv_id, request_id);
     assert!(matches!(recv_request, ClientRequest::InitializeRequest(_)));
 
@@ -40,23 +43,24 @@ async fn test_adapter_forwards_initialize_request_to_server() {
     let response = AgentResponse::InitializeResponse(initalize_response.clone());
     harness.server_reply(recv_id, response).await;
 
-    // Client receives the response
-    let result = harness.client_recv::<InitializeResponse>().await;
+    // Process the server response
+    harness.step().await;
+
+    // Client receives the response (no timeout needed)
+    let result = harness.client_recv::<InitializeResponse>();
     let Response::Result { id, result } = result else {
         panic!("expected InitializeResponse, got {:?}", result);
     };
 
     assert_eq!(id, request_id);
     assert_eq!(result, initalize_response);
-
-    harness.shutdown().await;
 }
 
 #[tokio::test]
 async fn test_adapter_injects_meta_into_new_session_request() {
     let config = test_config();
     let expected_meta = config.new_session_meta();
-    let mut harness = AdapterTestHarness::new(config).await;
+    let mut harness = AdapterTestHarness::new(config);
 
     // Client sends newSession request (without meta)
     harness
@@ -65,8 +69,11 @@ async fn test_adapter_injects_meta_into_new_session_request() {
         )))
         .await;
 
-    // Server receives the request with injected meta
-    let (_, received) = harness.server_recv_request().await;
+    // Process the client message
+    harness.step().await;
+
+    // Server receives the request with injected meta (no timeout needed)
+    let (_, received) = harness.server_recv_request();
     let ClientRequest::NewSessionRequest(r) = received else {
         panic!("expected NewSessionRequest, got {:?}", received);
     };
@@ -79,5 +86,4 @@ async fn test_adapter_injects_meta_into_new_session_request() {
         .expect("meta should be valid");
 
     assert_eq!(meta, Some(expected_meta));
-    harness.shutdown().await;
 }
