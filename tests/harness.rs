@@ -6,57 +6,14 @@
 //! The harness drives the adapter synchronously via `step()`, eliminating
 //! the need for timeouts and making tests deterministic.
 
-use acp_jcp::{Adapter, Config};
+use acp_jcp::{Adapter, Config, Transport};
 use agent_client_protocol::{
     AgentResponse, AgentSide, ClientRequest, ClientSide, JsonRpcMessage, OutgoingMessage, Request,
     RequestId, Response, Side,
 };
-use futures_util::{Sink, StreamExt};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use std::{
-    io,
-    pin::Pin,
-    task::{Context, Poll},
-};
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
-
-/// A Sink wrapper for mpsc::Sender<String>
-struct MpscSink {
-    tx: mpsc::Sender<String>,
-}
-
-impl Sink<String> for MpscSink {
-    type Error = mpsc::error::SendError<String>;
-
-    fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn start_send(self: Pin<&mut Self>, item: String) -> Result<(), Self::Error> {
-        self.get_mut().tx.try_send(item).map_err(|e| match e {
-            mpsc::error::TrySendError::Full(s) | mpsc::error::TrySendError::Closed(s) => {
-                mpsc::error::SendError(s)
-            }
-        })
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-}
-
-type TestAdapter = Adapter<
-    futures_util::stream::Map<ReceiverStream<String>, fn(String) -> Result<String, io::Error>>,
-    MpscSink,
-    futures_util::stream::Map<ReceiverStream<String>, fn(String) -> Result<String, io::Error>>,
-    MpscSink,
->;
 
 /// Test harness for the ACP-JCP adapter.
 ///
@@ -65,53 +22,29 @@ type TestAdapter = Adapter<
 ///
 /// The adapter is driven synchronously via `step()`, making tests
 /// deterministic without timeouts.
-pub struct AdapterTestHarness {
+pub struct TestHarness {
     /// The adapter instance
-    adapter: TestAdapter,
-    /// Send messages to adapter (from server side)
-    to_adapter_server_tx: mpsc::Sender<String>,
-    /// Receive messages from adapter (server side)
-    from_adapter_server_rx: mpsc::Receiver<String>,
-    /// Send messages to adapter (from client side, simulating stdin)
-    to_adapter_client_tx: mpsc::Sender<String>,
-    /// Receive messages from adapter (client side, simulating stdout)
-    from_adapter_client_rx: mpsc::Receiver<String>,
+    adapter: Adapter<ChannelTransport, ChannelTransport>,
+    /// Transport endpoint for the client side (simulates IDE)
+    client: ChannelTransport,
+    /// Transport endpoint for the server side (simulates JCP)
+    server: ChannelTransport,
     /// Next request ID for client requests
     next_request_id: u32,
 }
 
-impl AdapterTestHarness {
+impl TestHarness {
     /// Bootstrap a new test harness with the given config.
     pub fn new(config: Config) -> Self {
-        // Channels for test harness <-> adapter server side communication
-        let (to_adapter_server_tx, to_adapter_server_rx) = mpsc::channel::<String>(10);
-        let (from_adapter_server_tx, from_adapter_server_rx) = mpsc::channel::<String>(10);
+        let (downlink_adapter, downlink_test) = ChannelTransport::pair(10);
+        let (uplink_adapter, uplink_test) = ChannelTransport::pair(10);
 
-        // Channels for test harness <-> adapter client side communication
-        let (to_adapter_client_tx, to_adapter_client_rx) = mpsc::channel::<String>(10);
-        let (from_adapter_client_tx, from_adapter_client_rx) = mpsc::channel::<String>(10);
-
-        // Convert mpsc channels to Stream/Sink for the adapter
-        let client_rx =
-            ReceiverStream::new(to_adapter_client_rx).map(Ok::<_, io::Error> as fn(_) -> _);
-        let client_tx = MpscSink {
-            tx: from_adapter_client_tx,
-        };
-
-        let server_rx =
-            ReceiverStream::new(to_adapter_server_rx).map(Ok::<_, io::Error> as fn(_) -> _);
-        let server_tx = MpscSink {
-            tx: from_adapter_server_tx,
-        };
-
-        let adapter = Adapter::new(config, client_rx, client_tx, server_rx, server_tx);
+        let adapter = Adapter::new(config, downlink_adapter, uplink_adapter);
 
         Self {
             adapter,
-            to_adapter_server_tx,
-            from_adapter_server_rx,
-            to_adapter_client_tx,
-            from_adapter_client_rx,
+            client: downlink_test,
+            server: uplink_test,
             next_request_id: 1,
         }
     }
@@ -131,16 +64,15 @@ impl AdapterTestHarness {
         let id = RequestId::Number(self.next_request_id as i64);
         self.next_request_id += 1;
 
-        let method = request.method().to_string();
         let msg =
             JsonRpcMessage::wrap(OutgoingMessage::Request::<ClientSide, AgentSide>(Request {
                 id: id.clone(),
-                method: method.into(),
+                method: request.method().to_string().into(),
                 params: Some(request),
             }));
 
         let json = serde_json::to_string(&msg).unwrap();
-        self.to_adapter_client_tx.send(json).await.unwrap();
+        self.client.send(json).await;
 
         id
     }
@@ -151,10 +83,7 @@ impl AdapterTestHarness {
     /// Note: Call `step()` after this to process the message.
     #[allow(dead_code)]
     pub async fn client_send_raw(&mut self, json: &str) {
-        self.to_adapter_client_tx
-            .send(json.to_string())
-            .await
-            .unwrap();
+        self.client.send(json.to_string()).await;
     }
 
     /// Receive a request that the adapter forwarded to the server.
@@ -163,7 +92,7 @@ impl AdapterTestHarness {
     /// Note: Call `step()` before this to ensure the message has been processed.
     pub fn server_recv(&mut self) -> Value {
         let msg = self
-            .from_adapter_server_rx
+            .server
             .try_recv()
             .expect("no message available from server");
 
@@ -205,7 +134,7 @@ impl AdapterTestHarness {
         ));
 
         let json = serde_json::to_string(&msg).unwrap();
-        self.to_adapter_server_tx.send(json).await.unwrap();
+        self.server.send(json).await;
     }
 
     /// Send a raw JSON response from the server.
@@ -213,10 +142,7 @@ impl AdapterTestHarness {
     /// Note: Call `step()` after this to process the response.
     #[allow(dead_code)]
     pub async fn server_reply_raw(&mut self, json: &str) {
-        self.to_adapter_server_tx
-            .send(json.to_string())
-            .await
-            .unwrap();
+        self.server.send(json.to_string()).await;
     }
 
     /// Receive a response that the adapter forwarded to the client.
@@ -225,10 +151,50 @@ impl AdapterTestHarness {
     /// Note: Call `step()` before this to ensure the response has been processed.
     pub fn client_recv<T: DeserializeOwned>(&mut self) -> Response<T> {
         let msg = self
-            .from_adapter_client_rx
+            .client
             .try_recv()
             .expect("no message available for client");
 
         serde_json::from_str(&msg).expect("invalid JSON response")
+    }
+}
+
+/// Transport implementation using tokio mpsc channels.
+///
+/// Useful for testing where you need to control both ends of the transport.
+pub struct ChannelTransport {
+    rx: mpsc::Receiver<String>,
+    tx: mpsc::Sender<String>,
+}
+
+impl ChannelTransport {
+    pub fn new(rx: mpsc::Receiver<String>, tx: mpsc::Sender<String>) -> Self {
+        Self { rx, tx }
+    }
+
+    /// Create a pair of connected transports.
+    ///
+    /// Returns `(a, b)` where messages sent on `a` are received on `b` and vice versa.
+    pub fn pair(buffer: usize) -> (Self, Self) {
+        let (tx_a, rx_a) = mpsc::channel(buffer);
+        let (tx_b, rx_b) = mpsc::channel(buffer);
+        (Self::new(rx_a, tx_b), Self::new(rx_b, tx_a))
+    }
+
+    /// Try to receive a message without blocking.
+    ///
+    /// Returns `Some(msg)` if a message is available, `None` otherwise.
+    pub fn try_recv(&mut self) -> Option<String> {
+        self.rx.try_recv().ok()
+    }
+}
+
+impl Transport for ChannelTransport {
+    async fn recv(&mut self) -> Option<String> {
+        self.rx.recv().await
+    }
+
+    async fn send(&mut self, msg: String) {
+        let _ = self.tx.send(msg).await;
     }
 }

@@ -5,7 +5,7 @@ use agent_client_protocol::{
     AgentResponse, ClientRequest, InitializeRequest, InitializeResponse, NewSessionRequest,
     ProtocolVersion, Response,
 };
-use harness::AdapterTestHarness;
+use harness::TestHarness;
 
 const TEST_GIT_URL: &str = "https://github.com/test/repo.git";
 const TEST_BRANCH: &str = "main";
@@ -24,7 +24,7 @@ fn test_config() -> Config {
 
 #[tokio::test]
 async fn test_adapter_forwards_initialize_request_to_server() {
-    let mut harness = AdapterTestHarness::new(test_config());
+    let mut harness = TestHarness::new(test_config());
 
     // Client sends initialize request
     let request = ClientRequest::InitializeRequest(InitializeRequest::new(1.into()));
@@ -60,7 +60,7 @@ async fn test_adapter_forwards_initialize_request_to_server() {
 async fn test_adapter_injects_meta_into_new_session_request() {
     let config = test_config();
     let expected_meta = config.new_session_meta();
-    let mut harness = AdapterTestHarness::new(config);
+    let mut harness = TestHarness::new(config);
 
     // Client sends newSession request (without meta)
     harness

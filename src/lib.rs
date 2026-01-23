@@ -6,153 +6,95 @@ use futures::{Sink, Stream};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{
-    error::Error as StdError,
-    fmt::Debug,
-    io,
-    pin::Pin,
-    task::{Context, Poll},
+use tokio::{
+    io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
+    sync::mpsc,
 };
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader, Lines};
 use tungstenite::{Message, Utf8Bytes};
 
-/// A Stream adapter that reads newline-delimited JSON from an async reader
-pub struct StdinStream<R> {
-    lines: Lines<BufReader<R>>,
+/// A bidirectional transport for JSON-RPC messages.
+///
+/// This trait abstracts over different transport mechanisms (stdio, websocket, channels)
+/// providing a simple async interface for sending and receiving string messages.
+pub trait Transport {
+    /// Receive the next message from the transport.
+    /// Returns `None` when the transport is closed.
+    async fn recv(&mut self) -> Option<String>;
+
+    /// Send a message through the transport.
+    async fn send(&mut self, msg: String);
 }
 
-impl<R: AsyncRead + Unpin> StdinStream<R> {
-    pub fn new(reader: R) -> Self {
-        Self {
-            lines: BufReader::new(reader).lines(),
-        }
-    }
-}
-
-impl<R: AsyncRead + Unpin> Stream for StdinStream<R> {
-    type Item = Result<String, io::Error>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.lines).poll_next_line(cx).map(|result| {
-            match result {
-                Ok(Some(line)) => Some(Ok(line)),
-                Ok(None) => None, // EOF
-                Err(e) => Some(Err(e)),
-            }
-        })
-    }
-}
-
-/// A Sink adapter that writes newline-delimited strings to an async writer
-pub struct StdoutSink<W> {
+/// Transport implementation for ardbitrrary [`Read`]/[`Write`] impls.
+///
+/// Reads newline-delimited JSON from reader and writes newline-delimited JSON to stdout.
+pub struct IoTransport<R, W> {
+    reader: BufReader<R>,
     writer: W,
-    buffer: Vec<u8>,
-    written: usize,
 }
 
-impl<W: AsyncWrite + Unpin> StdoutSink<W> {
-    pub fn new(writer: W) -> Self {
+impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> IoTransport<R, W> {
+    pub fn new(reader: R, writer: W) -> Self {
         Self {
+            reader: BufReader::new(reader),
             writer,
-            buffer: Vec::new(),
-            written: 0,
         }
     }
 }
 
-impl<W: AsyncWrite + Unpin> Sink<String> for StdoutSink<W> {
-    type Error = io::Error;
-
-    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        // Ready when buffer is empty (previous write completed)
-        if self.buffer.is_empty() {
-            Poll::Ready(Ok(()))
-        } else {
-            // Need to flush first
-            self.poll_flush(cx)
+impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Transport for IoTransport<R, W> {
+    async fn recv(&mut self) -> Option<String> {
+        let mut line = String::new();
+        match self.reader.read_line(&mut line).await {
+            Ok(0) => None, // EOF
+            Ok(_) => {
+                // Remove trailing newline
+                if line.ends_with('\n') {
+                    line.pop();
+                }
+                Some(line)
+            }
+            Err(_) => None,
         }
     }
 
-    fn start_send(mut self: Pin<&mut Self>, item: String) -> Result<(), Self::Error> {
-        // Buffer the data with newline
-        self.buffer.extend_from_slice(item.as_bytes());
-        self.buffer.push(b'\n');
-        self.written = 0;
-        Ok(())
+    async fn send(&mut self, msg: String) {
+        let _ = self.writer.write_all(msg.as_bytes()).await;
+        let _ = self.writer.write_all(b"\n").await;
+        let _ = self.writer.flush().await;
     }
+}
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        let this = &mut *self;
-        while this.written < this.buffer.len() {
-            let buf = &this.buffer[this.written..];
-            match Pin::new(&mut this.writer).poll_write(cx, buf) {
-                Poll::Ready(Ok(n)) => {
-                    this.written += n;
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
+/// Transport implementation for WebSocket connections.
+pub struct WebSocketTransport<WsRx, WsTx> {
+    rx: WsRx,
+    tx: WsTx,
+}
+
+impl<WsRx, WsTx> WebSocketTransport<WsRx, WsTx> {
+    pub fn new(rx: WsRx, tx: WsTx) -> Self {
+        Self { rx, tx }
+    }
+}
+
+impl<WsRx, WsTx> Transport for WebSocketTransport<WsRx, WsTx>
+where
+    WsRx: Stream<Item = Result<Message, tungstenite::Error>> + Unpin,
+    WsTx: Sink<Message, Error = tungstenite::Error> + Unpin,
+{
+    async fn recv(&mut self) -> Option<String> {
+        loop {
+            match self.rx.next().await? {
+                Ok(Message::Text(text)) => return Some(text.to_string()),
+                Ok(_) => continue, // Skip non-text messages
+                Err(_) => return None,
             }
         }
-        // All data written, clear buffer
-        this.buffer.clear();
-        this.written = 0;
-        // Flush the underlying writer
-        Pin::new(&mut this.writer).poll_flush(cx)
     }
 
-    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        // Flush any remaining data first
-        match self.as_mut().poll_flush(cx) {
-            Poll::Ready(Ok(())) => Pin::new(&mut self.writer).poll_shutdown(cx),
-            other => other,
-        }
+    async fn send(&mut self, msg: String) {
+        let _ = self.tx.send(Message::Text(Utf8Bytes::from(msg))).await;
     }
-}
-
-/// Adapts a WebSocket stream into String-based Stream and Sink.
-///
-/// Takes a split WebSocket stream and returns:
-/// - A `Stream<Item = Result<String, io::Error>>` for receiving text messages
-/// - A `Sink<String, Error = io::Error>` for sending text messages
-///
-/// Non-text WebSocket messages are filtered out from the receive stream.
-pub fn adapt_ws_stream<WsRx, WsTx>(
-    ws_rx: WsRx,
-    ws_tx: WsTx,
-) -> (
-    Pin<Box<dyn Stream<Item = Result<String, io::Error>> + Send>>,
-    Pin<Box<dyn Sink<String, Error = io::Error> + Send>>,
-)
-where
-    WsRx: Stream<Item = Result<Message, tungstenite::Error>> + Send + 'static,
-    WsTx: Sink<Message, Error = tungstenite::Error> + Send + 'static,
-{
-    let rx = Box::pin(ws_rx.filter_map(|msg| async move {
-        let result = match msg {
-            Ok(Message::Text(text)) => Ok(text.to_string()),
-            Ok(_) => Err(io::Error::new(
-                io::ErrorKind::Other,
-                "Unexpected message type",
-            )),
-            Err(e) => Err(to_io_error(e)),
-        };
-        Some(result)
-    }));
-
-    let tx = Box::pin(
-        ws_tx
-            .sink_map_err(to_io_error)
-            .with(|s| async move { Ok(Message::Text(Utf8Bytes::from(s))) }),
-    );
-
-    (rx, tx)
-}
-
-fn to_io_error<E>(e: E) -> io::Error
-where
-    E: Into<Box<dyn StdError + Send + Sync>>,
-{
-    io::Error::new(io::ErrorKind::Other, e)
 }
 
 /// Configuration for the ACP-JCP adapter
@@ -216,37 +158,26 @@ pub struct RawIncomingMessage<'a> {
 ///
 /// This struct processes messages from both channels using `tokio::select!`,
 /// allowing for synchronous test-driving without spawning separate tasks.
-pub struct Adapter<ClientRx, ClientTx, ServerRx, ServerTx> {
+pub struct Adapter<Downlink, Uplink> {
     new_session_meta: NewSessionMeta,
-    client_rx: ClientRx,
-    client_tx: ClientTx,
-    server_rx: ServerRx,
-    server_tx: ServerTx,
+    downlink: Downlink,
+    uplink: Uplink,
 }
 
-impl<ClientRx, ClientTx, ServerRx, ServerTx> Adapter<ClientRx, ClientTx, ServerRx, ServerTx>
+impl<Downlink, Uplink> Adapter<Downlink, Uplink>
 where
-    ClientRx: Stream<Item = Result<String, io::Error>> + Unpin,
-    ClientTx: Sink<String> + Unpin,
-    ClientTx::Error: Debug,
-    ServerRx: Stream<Item = Result<String, io::Error>> + Unpin,
-    ServerTx: Sink<String> + Unpin,
-    ServerTx::Error: Debug,
+    Downlink: Transport,
+    Uplink: Transport,
 {
-    /// Create a new adapter with the given configuration and transport streams.
-    pub fn new(
-        config: Config,
-        client_rx: ClientRx,
-        client_tx: ClientTx,
-        server_rx: ServerRx,
-        server_tx: ServerTx,
-    ) -> Self {
+    /// Create a new adapter with the given configuration and transports.
+    ///
+    /// - `downlink`: transport to the client (IDE)
+    /// - `uplink`: transport to the server (JCP)
+    pub fn new(config: Config, downlink: Downlink, uplink: Uplink) -> Self {
         Self {
             new_session_meta: config.new_session_meta(),
-            client_rx,
-            client_tx,
-            server_rx,
-            server_tx,
+            downlink,
+            uplink,
         }
     }
 
@@ -256,10 +187,10 @@ where
     /// Returns `None` when both channels are closed (end of communication).
     pub async fn handle_next_message(&mut self) -> Option<()> {
         tokio::select! {
-            Some(Ok(msg)) = self.client_rx.next() => {
+            Some(msg) = self.downlink.recv() => {
                 self.handle_client_message(msg).await;
             }
-            Some(Ok(msg)) = self.server_rx.next() => {
+            Some(msg) = self.uplink.recv() => {
                 self.handle_server_message(msg).await;
             }
             else => return None,
@@ -286,16 +217,16 @@ where
                 }));
 
             let json = serde_json::to_string(&msg).unwrap();
-            self.server_tx.send(json).await.unwrap();
+            self.uplink.send(json).await;
         } else {
             // Sending notifications to JCP without modification
-            self.server_tx.send(msg).await.unwrap();
+            self.uplink.send(msg).await;
         }
     }
 
     /// Handle a message from the server (downlink: server -> client)
     async fn handle_server_message(&mut self, msg: String) {
-        self.client_tx.send(msg).await.unwrap();
+        self.downlink.send(msg).await;
     }
 
     /// Run the adapter until both channels are closed.

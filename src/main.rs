@@ -1,4 +1,4 @@
-use acp_jcp::{Adapter, Config, StdinStream, StdoutSink, adapt_ws_stream};
+use acp_jcp::{Adapter, Config, IoTransport, WebSocketTransport};
 use dotenv::dotenv;
 use futures_util::StreamExt;
 use std::env;
@@ -37,11 +37,10 @@ async fn main() {
 
     let (ws_stream, _) = connect_async(request).await.unwrap();
     let (ws_tx, ws_rx) = ws_stream.split();
-    let (server_rx, server_tx) = adapt_ws_stream(ws_rx, ws_tx);
 
-    let client_rx = StdinStream::new(stdin());
-    let client_tx = StdoutSink::new(stdout());
+    let downlink = IoTransport::new(stdin(), stdout());
+    let uplink = WebSocketTransport::new(ws_rx, ws_tx);
 
-    let mut adapter = Adapter::new(config, client_rx, client_tx, server_rx, server_tx);
+    let mut adapter = Adapter::new(config, downlink, uplink);
     while adapter.handle_next_message().await.is_some() {}
 }
