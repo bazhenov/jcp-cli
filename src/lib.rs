@@ -24,24 +24,27 @@ pub trait Transport {
     async fn send(&mut self, msg: Value) -> io::Result<()>;
 }
 
-/// Transport implementation for ardbitrrary [`Read`]/[`Write`] impls.
+/// Transport implementation for arbitrary async readers/writers.
 ///
-/// Reads newline-delimited JSON from reader and writes newline-delimited JSON to stdout.
-pub struct IoTransport<R, W> {
-    reader: BufReader<R>,
-    writer: W,
+/// Reads newline-delimited JSON from reader and writes newline-delimited JSON to writer.
+pub struct IoTransport {
+    reader: BufReader<Box<dyn AsyncRead + Unpin + Send>>,
+    writer: Box<dyn AsyncWrite + Unpin + Send>,
 }
 
-impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> IoTransport<R, W> {
-    pub fn new(reader: R, writer: W) -> Self {
+impl IoTransport {
+    pub fn new(
+        reader: impl AsyncRead + Unpin + Send + 'static,
+        writer: impl AsyncWrite + Unpin + Send + 'static,
+    ) -> Self {
         Self {
-            reader: BufReader::new(reader),
-            writer,
+            reader: BufReader::new(Box::new(reader)),
+            writer: Box::new(writer),
         }
     }
 }
 
-impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Transport for IoTransport<R, W> {
+impl Transport for IoTransport {
     async fn recv(&mut self) -> io::Result<Option<Value>> {
         let mut line = String::new();
         match self.reader.read_line(&mut line).await? {
@@ -68,22 +71,24 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Transport for IoTransport<R, W
 }
 
 /// Transport implementation for WebSocket connections.
-pub struct WebSocketTransport<WsRx, WsTx> {
-    rx: WsRx,
-    tx: WsTx,
+pub struct WebSocketTransport {
+    rx: Box<dyn Stream<Item = Result<Message, tungstenite::Error>> + Unpin + Send>,
+    tx: Box<dyn Sink<Message, Error = tungstenite::Error> + Unpin + Send>,
 }
 
-impl<WsRx, WsTx> WebSocketTransport<WsRx, WsTx> {
-    pub fn new(rx: WsRx, tx: WsTx) -> Self {
-        Self { rx, tx }
+impl WebSocketTransport {
+    pub fn new(
+        rx: impl Stream<Item = Result<Message, tungstenite::Error>> + Unpin + Send + 'static,
+        tx: impl Sink<Message, Error = tungstenite::Error> + Unpin + Send + 'static,
+    ) -> Self {
+        Self {
+            rx: Box::new(rx),
+            tx: Box::new(tx),
+        }
     }
 }
 
-impl<WsRx, WsTx> Transport for WebSocketTransport<WsRx, WsTx>
-where
-    WsRx: Stream<Item = Result<Message, tungstenite::Error>> + Unpin,
-    WsTx: Sink<Message, Error = tungstenite::Error> + Unpin,
-{
+impl Transport for WebSocketTransport {
     async fn recv(&mut self) -> io::Result<Option<Value>> {
         loop {
             match self.rx.next().await {
@@ -212,6 +217,8 @@ where
 
     /// Handle a message from the client (uplink: client -> server)
     async fn handle_client_message(&mut self, msg: Value) {
+        // This is ungly hack, but we need to serialize here back to string, otherwise
+        // we can not use AgentSide::decode_request()
         let msg_str = msg.to_string();
         let rpc_msg: RawIncomingMessage<'_> = serde_json::from_str(&msg_str).unwrap();
 
