@@ -13,6 +13,7 @@ use agent_client_protocol::{
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use std::io;
 use tokio::sync::mpsc;
 
 /// Test harness for the ACP-JCP adapter.
@@ -71,8 +72,8 @@ impl TestHarness {
                 params: Some(request),
             }));
 
-        let json = serde_json::to_string(&msg).unwrap();
-        self.client.send(json).await;
+        let value = serde_json::to_value(&msg).unwrap();
+        let _ = self.client.send(value).await;
 
         id
     }
@@ -83,7 +84,8 @@ impl TestHarness {
     /// Note: Call `step()` after this to process the message.
     #[allow(dead_code)]
     pub async fn client_send_raw(&mut self, json: &str) {
-        self.client.send(json.to_string()).await;
+        let value: Value = serde_json::from_str(json).unwrap();
+        let _ = self.client.send(value).await;
     }
 
     /// Receive a request that the adapter forwarded to the server.
@@ -91,12 +93,9 @@ impl TestHarness {
     /// Returns the raw JSON value for flexible assertions.
     /// Note: Call `step()` before this to ensure the message has been processed.
     pub fn server_recv(&mut self) -> Value {
-        let msg = self
-            .server
+        self.server
             .try_recv()
-            .expect("no message available from server");
-
-        serde_json::from_str(&msg).expect("invalid JSON from adapter")
+            .expect("no message available from server")
     }
 
     /// Receive a request that the adapter forwarded to the server, parsed as ClientRequest.
@@ -133,8 +132,8 @@ impl TestHarness {
             Response::new(id, Ok::<_, agent_client_protocol::Error>(response)),
         ));
 
-        let json = serde_json::to_string(&msg).unwrap();
-        self.server.send(json).await;
+        let value = serde_json::to_value(&msg).unwrap();
+        let _ = self.server.send(value).await;
     }
 
     /// Send a raw JSON response from the server.
@@ -142,7 +141,8 @@ impl TestHarness {
     /// Note: Call `step()` after this to process the response.
     #[allow(dead_code)]
     pub async fn server_reply_raw(&mut self, json: &str) {
-        self.server.send(json.to_string()).await;
+        let value: Value = serde_json::from_str(json).unwrap();
+        let _ = self.server.send(value).await;
     }
 
     /// Receive a response that the adapter forwarded to the client.
@@ -150,12 +150,12 @@ impl TestHarness {
     /// Returns the parsed response for assertions.
     /// Note: Call `step()` before this to ensure the response has been processed.
     pub fn client_recv<T: DeserializeOwned>(&mut self) -> Response<T> {
-        let msg = self
+        let value = self
             .client
             .try_recv()
             .expect("no message available for client");
 
-        serde_json::from_str(&msg).expect("invalid JSON response")
+        serde_json::from_value(value).expect("invalid JSON response")
     }
 }
 
@@ -163,12 +163,12 @@ impl TestHarness {
 ///
 /// Useful for testing where you need to control both ends of the transport.
 pub struct ChannelTransport {
-    rx: mpsc::Receiver<String>,
-    tx: mpsc::Sender<String>,
+    rx: mpsc::Receiver<Value>,
+    tx: mpsc::Sender<Value>,
 }
 
 impl ChannelTransport {
-    pub fn new(rx: mpsc::Receiver<String>, tx: mpsc::Sender<String>) -> Self {
+    pub fn new(rx: mpsc::Receiver<Value>, tx: mpsc::Sender<Value>) -> Self {
         Self { rx, tx }
     }
 
@@ -184,17 +184,17 @@ impl ChannelTransport {
     /// Try to receive a message without blocking.
     ///
     /// Returns `Some(msg)` if a message is available, `None` otherwise.
-    pub fn try_recv(&mut self) -> Option<String> {
+    pub fn try_recv(&mut self) -> Option<Value> {
         self.rx.try_recv().ok()
     }
 }
 
 impl Transport for ChannelTransport {
-    async fn recv(&mut self) -> Option<String> {
-        self.rx.recv().await
+    async fn recv(&mut self) -> io::Result<Option<Value>> {
+        Ok(self.rx.recv().await)
     }
 
-    async fn send(&mut self, msg: String) {
-        let _ = self.tx.send(msg).await;
+    async fn send(&mut self, msg: Value) -> io::Result<()> {
+        self.tx.send(msg).await.map_err(io::Error::other)
     }
 }

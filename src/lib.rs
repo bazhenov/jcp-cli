@@ -6,23 +6,22 @@ use futures::{Sink, Stream};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::{
-    io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
-    sync::mpsc,
-};
+use std::io;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tungstenite::{Message, Utf8Bytes};
 
 /// A bidirectional transport for JSON-RPC messages.
 ///
 /// This trait abstracts over different transport mechanisms (stdio, websocket, channels)
-/// providing a simple async interface for sending and receiving string messages.
+/// providing a simple async interface for sending and receiving JSON values.
+#[allow(async_fn_in_trait)]
 pub trait Transport {
     /// Receive the next message from the transport.
-    /// Returns `None` when the transport is closed.
-    async fn recv(&mut self) -> Option<String>;
+    /// Returns `Ok(None)` when the transport is closed.
+    async fn recv(&mut self) -> io::Result<Option<Value>>;
 
     /// Send a message through the transport.
-    async fn send(&mut self, msg: String);
+    async fn send(&mut self, msg: Value) -> io::Result<()>;
 }
 
 /// Transport implementation for ardbitrrary [`Read`]/[`Write`] impls.
@@ -43,25 +42,28 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> IoTransport<R, W> {
 }
 
 impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Transport for IoTransport<R, W> {
-    async fn recv(&mut self) -> Option<String> {
+    async fn recv(&mut self) -> io::Result<Option<Value>> {
         let mut line = String::new();
-        match self.reader.read_line(&mut line).await {
-            Ok(0) => None, // EOF
-            Ok(_) => {
+        match self.reader.read_line(&mut line).await? {
+            0 => Ok(None), // EOF
+            _ => {
                 // Remove trailing newline
                 if line.ends_with('\n') {
                     line.pop();
                 }
-                Some(line)
+                let value = serde_json::from_str(&line)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                Ok(Some(value))
             }
-            Err(_) => None,
         }
     }
 
-    async fn send(&mut self, msg: String) {
-        let _ = self.writer.write_all(msg.as_bytes()).await;
-        let _ = self.writer.write_all(b"\n").await;
-        let _ = self.writer.flush().await;
+    async fn send(&mut self, msg: Value) -> io::Result<()> {
+        let json = serde_json::to_string(&msg)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        self.writer.write_all(json.as_bytes()).await?;
+        self.writer.write_all(b"\n").await?;
+        self.writer.flush().await
     }
 }
 
@@ -82,18 +84,28 @@ where
     WsRx: Stream<Item = Result<Message, tungstenite::Error>> + Unpin,
     WsTx: Sink<Message, Error = tungstenite::Error> + Unpin,
 {
-    async fn recv(&mut self) -> Option<String> {
+    async fn recv(&mut self) -> io::Result<Option<Value>> {
         loop {
-            match self.rx.next().await? {
-                Ok(Message::Text(text)) => return Some(text.to_string()),
-                Ok(_) => continue, // Skip non-text messages
-                Err(_) => return None,
+            match self.rx.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let value = serde_json::from_str(&text)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                    return Ok(Some(value));
+                }
+                Some(Ok(_)) => continue, // Skip non-text messages
+                Some(Err(e)) => return Err(io::Error::other(e)),
+                None => return Ok(None),
             }
         }
     }
 
-    async fn send(&mut self, msg: String) {
-        let _ = self.tx.send(Message::Text(Utf8Bytes::from(msg))).await;
+    async fn send(&mut self, msg: Value) -> io::Result<()> {
+        let json = serde_json::to_string(&msg)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        self.tx
+            .send(Message::Text(Utf8Bytes::from(json)))
+            .await
+            .map_err(io::Error::other)
     }
 }
 
@@ -187,10 +199,10 @@ where
     /// Returns `None` when both channels are closed (end of communication).
     pub async fn handle_next_message(&mut self) -> Option<()> {
         tokio::select! {
-            Some(msg) = self.downlink.recv() => {
+            Ok(Some(msg)) = self.downlink.recv() => {
                 self.handle_client_message(msg).await;
             }
-            Some(msg) = self.uplink.recv() => {
+            Ok(Some(msg)) = self.uplink.recv() => {
                 self.handle_server_message(msg).await;
             }
             else => return None,
@@ -199,8 +211,9 @@ where
     }
 
     /// Handle a message from the client (uplink: client -> server)
-    async fn handle_client_message(&mut self, msg: String) {
-        let rpc_msg: RawIncomingMessage<'_> = serde_json::from_slice(msg.as_bytes()).unwrap();
+    async fn handle_client_message(&mut self, msg: Value) {
+        let msg_str = msg.to_string();
+        let rpc_msg: RawIncomingMessage<'_> = serde_json::from_str(&msg_str).unwrap();
 
         if let Some((method, id)) = rpc_msg.method.zip(rpc_msg.id) {
             let mut request = AgentSide::decode_request(method, rpc_msg.params).unwrap();
@@ -216,17 +229,17 @@ where
                     params: Some(request),
                 }));
 
-            let json = serde_json::to_string(&msg).unwrap();
-            self.uplink.send(json).await;
+            let value = serde_json::to_value(&msg).unwrap();
+            let _ = self.uplink.send(value).await;
         } else {
             // Sending notifications to JCP without modification
-            self.uplink.send(msg).await;
+            let _ = self.uplink.send(msg).await;
         }
     }
 
     /// Handle a message from the server (downlink: server -> client)
-    async fn handle_server_message(&mut self, msg: String) {
-        self.downlink.send(msg).await;
+    async fn handle_server_message(&mut self, msg: Value) {
+        let _ = self.downlink.send(msg).await;
     }
 
     /// Run the adapter until both channels are closed.
