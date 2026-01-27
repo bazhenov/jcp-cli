@@ -7,8 +7,13 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::io;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, Lines};
+use tokio::{
+    fs::File,
+    io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, Lines},
+};
 use tungstenite::{Message, Utf8Bytes};
+
+pub mod auth;
 
 /// A bidirectional transport for JSON-RPC messages.
 ///
@@ -51,12 +56,9 @@ impl Transport for IoTransport {
     async fn recv(&mut self) -> io::Result<Option<JsonValue>> {
         // Lines::next_line() is cancellation safe per tokio documentation
         match self.lines.next_line().await? {
-            Some(line) => {
-                println!("Line: {line}");
-                serde_json::from_str(&line)
-                    .map_err(to_io_invalid_data_err)
-                    .map(Some)
-            }
+            Some(line) => serde_json::from_str(&line)
+                .map_err(to_io_invalid_data_err)
+                .map(Some),
             None => Ok(None),
         }
     }
@@ -177,6 +179,7 @@ pub struct Adapter<Downlink, Uplink> {
     new_session_meta: NewSessionMeta,
     downlink: Downlink,
     uplink: Uplink,
+    traffic_log: TrafficLog,
 }
 
 impl<Downlink, Uplink> Adapter<Downlink, Uplink>
@@ -193,7 +196,12 @@ where
             new_session_meta: config.new_session_meta(),
             downlink,
             uplink,
+            traffic_log: TrafficLog::default(),
         }
+    }
+
+    pub fn set_traffic_log(&mut self, traffic_log: TrafficLog) {
+        self.traffic_log = traffic_log;
     }
 
     /// Process the next message from either the client or server channel.
@@ -203,9 +211,13 @@ where
     pub async fn handle_next_message(&mut self) -> io::Result<Option<()>> {
         tokio::select! {
             Ok(Some(msg)) = self.downlink.recv() => {
+                eprint!("=== Client -> Server ===\n{:?}\n", msg);
+                self.traffic_log.write(msg.clone()).await?;
                 self.handle_client_message(msg).await?;
             }
             Ok(Some(msg)) = self.uplink.recv() => {
+                eprint!("=== Server -> Client ===\n{:?}\n", msg);
+                self.traffic_log.write(msg.clone()).await?;
                 self.downlink.send(msg).await?;
             }
             else => return Ok(None),
@@ -249,6 +261,31 @@ where
     pub async fn run(&mut self) -> io::Result<()> {
         while self.handle_next_message().await?.is_some() {}
         Ok(())
+    }
+}
+
+#[derive(Default)]
+pub struct TrafficLog {
+    file: Option<File>,
+}
+
+impl TrafficLog {
+    pub async fn new(path: Option<impl AsRef<std::path::Path>>) -> io::Result<Self> {
+        let file = if let Some(path) = path {
+            Some(File::create(path).await?)
+        } else {
+            None
+        };
+        Ok(Self { file })
+    }
+
+    pub async fn write(&mut self, msg: JsonValue) -> io::Result<()> {
+        if let Some(file) = &mut self.file {
+            let json = serde_json::to_string_pretty(&msg).map_err(to_io_invalid_data_err)?;
+            file.write_all(json.as_bytes()).await
+        } else {
+            Ok(())
+        }
     }
 }
 

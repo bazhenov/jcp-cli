@@ -13,14 +13,13 @@ serde_json = "1.0.149"
 tokio = { version = "1.49.0", features = ["full"] }
 tokio-tungstenite = { version = "0.28.0", features = ["native-tls"] }
 tungstenite = "0.28.0"
+oauth2 = { version = "5", features = ["reqwest-blocking"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+open = "5"
+url = "2"
+tiny_http = "0.12"
 
 [dev-dependencies]
 drop-check = { git = "https://github.com/bazhenov/drop-check" }
 tokio-test = "0.4"
 tokio-stream = "0.1"
-
-# Dependencies for examples
-oauth2 = { version = "5", features = ["reqwest-blocking"] }
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
-open = "5"
-url = "2"

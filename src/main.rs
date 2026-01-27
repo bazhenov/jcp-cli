@@ -1,8 +1,13 @@
-use acp_jcp::{Adapter, Config, IoTransport, WebSocketTransport};
+use acp_jcp::{
+    Adapter, Config, IoTransport, TrafficLog, WebSocketTransport, auth::authenticate_get_token,
+};
 use dotenv::dotenv;
 use futures_util::StreamExt;
 use std::env;
-use tokio::io::{stdin, stdout};
+use tokio::{
+    io::{stdin, stdout},
+    task::spawn_blocking,
+};
 use tokio_tungstenite::connect_async;
 use tungstenite::client::IntoClientRequest;
 
@@ -10,16 +15,24 @@ use tungstenite::client::IntoClientRequest;
 async fn main() {
     dotenv().ok();
 
-    let jba_access_token =
-        env::var("JBA_ACCESS_TOKEN").expect("JBA_ACCESS_TOKEN env variable should be configured");
     let git_url = env::var("GIT_URL").expect("GIT_URL env variable should be configured");
-
     let anthropic_key =
         env::var("ANTHROPIC_KEY").expect("ANTHROPIC_KEY env variable should be configured");
-
     let jcp_url = env::var("JCP_URL")
         .ok()
         .unwrap_or("wss://api.stgn.jetbrainscloud.com/agent-spawner/acp".into());
+    let traffic_log = TrafficLog::new(env::var("TRAFFIC_LOG").ok()).await.unwrap();
+
+    // reading authentication is a blocking process
+    let jba_access_token = spawn_blocking(|| {
+        if let Some(access_key) = env::var("JBA_ACCESS_TOKEN").ok() {
+            access_key
+        } else {
+            authenticate_get_token().unwrap()
+        }
+    })
+    .await
+    .unwrap();
 
     let mut request = jcp_url.into_client_request().unwrap();
     request.headers_mut().insert(
@@ -42,6 +55,7 @@ async fn main() {
     let uplink = WebSocketTransport::new(ws_rx, ws_tx);
 
     let mut adapter = Adapter::new(config, downlink, uplink);
+    adapter.set_traffic_log(traffic_log);
     while adapter
         .handle_next_message()
         .await
