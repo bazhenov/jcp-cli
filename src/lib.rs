@@ -11,7 +11,10 @@ use tokio::{
     fs::File,
     io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, Lines},
 };
-use tungstenite::{Message, Utf8Bytes};
+use tungstenite::{
+    Message, Utf8Bytes,
+    protocol::{CloseFrame, frame::coding::CloseCode},
+};
 
 pub mod auth;
 pub mod keychain;
@@ -93,16 +96,48 @@ impl WebSocketTransport {
 
 impl Transport for WebSocketTransport {
     async fn recv(&mut self) -> io::Result<Option<JsonValue>> {
-        match self.rx.next().await {
-            Some(Ok(Message::Text(text))) => serde_json::from_str(&text)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-                .map(Some),
-            Some(Ok(_)) => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Only text messages are supported",
-            )),
-            Some(Err(e)) => Err(io::Error::other(e)),
-            None => Ok(None),
+        loop {
+            match self.rx.next().await {
+                Some(Ok(msg)) => match msg {
+                    Message::Text(text) => {
+                        return serde_json::from_str(&text)
+                            .map_err(to_io_invalid_data_err)
+                            .map(Some);
+                    }
+                    Message::Binary(_) => {
+                        eprintln!("Message::Binary is not supported. Skipping");
+                        continue;
+                    }
+                    Message::Ping(bytes) => {
+                        self.tx
+                            .send(Message::Pong(bytes))
+                            .await
+                            .map_err(io::Error::other)?;
+                        continue;
+                    }
+                    Message::Pong(_) => continue,
+                    Message::Close(close_frame) => {
+                        // Replying with the close frame
+                        let _ = self.tx.send(Message::Close(None)).await;
+                        return match close_frame {
+                            Some(CloseFrame {
+                                code: CloseCode::Normal,
+                                ..
+                            }) => Ok(None),
+                            close_frame => Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                format!("Close frame received: {:?}", close_frame),
+                            )),
+                        };
+                    }
+                    Message::Frame(_) => {
+                        eprintln!("Message::Frame is not supported. Skipping");
+                        continue;
+                    }
+                },
+                Some(Err(e)) => return Err(io::Error::other(e)),
+                None => return Ok(None),
+            }
         }
     }
 
