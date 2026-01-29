@@ -5,6 +5,7 @@
 use security_framework::passwords::{
     delete_generic_password, get_generic_password, set_generic_password,
 };
+use std::string::FromUtf8Error;
 use thiserror::Error;
 
 /// Service identifier for Keychain storage
@@ -21,10 +22,7 @@ pub enum KeychainError {
     SecurityFramework(#[from] security_framework::base::Error),
 
     #[error("Invalid UTF-8 in stored token")]
-    InvalidUtf8(#[from] std::string::FromUtf8Error),
-
-    #[error("No refresh token found. Please run `acp-jcp login` first.")]
-    NotFound,
+    InvalidUtf8(#[from] FromUtf8Error),
 }
 
 pub fn store_refresh_token(token: &str) -> Result<(), KeychainError> {
@@ -35,15 +33,8 @@ pub fn store_refresh_token(token: &str) -> Result<(), KeychainError> {
 pub fn get_refresh_token() -> Result<Option<String>, KeychainError> {
     match get_generic_password(SERVICE, REFRESH_TOKEN_ACCOUNT) {
         Ok(bytes) => Ok(Some(String::from_utf8(bytes)?)),
-        Err(e) => {
-            // Check if it's a "not found" error
-            if e.code() == OS_STATUS_NOT_FOUND {
-                // errSecItemNotFound
-                Ok(None)
-            } else {
-                Err(KeychainError::SecurityFramework(e))
-            }
-        }
+        Err(e) if e.code() == OS_STATUS_NOT_FOUND => Ok(None),
+        Err(e) => Err(KeychainError::SecurityFramework(e)),
     }
 }
 

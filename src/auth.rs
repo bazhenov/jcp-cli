@@ -13,10 +13,6 @@ use thiserror::Error;
 use tiny_http::{Response, Server};
 use url::Url;
 
-// =============================================================================
-// Constants
-// =============================================================================
-
 /// Base URL for JetBrains OAuth provider
 const OAUTH_BASE_URL: &str = "https://public.aip.oauth.intservices.aws.intellij.net";
 
@@ -32,10 +28,6 @@ const JCP_AS_AUDIENCE: &str = "jcp-agent-spawner";
 /// The expected callback path for OAuth redirect
 const CALLBACK_PATH: &str = "/space/auth";
 
-// =============================================================================
-// Public API
-// =============================================================================
-
 /// Performs OAuth browser login flow and returns a refresh token.
 ///
 /// This function:
@@ -48,68 +40,7 @@ const CALLBACK_PATH: &str = "/space/auth";
 /// `get_access_token()` to obtain access tokens without re-authentication.
 pub fn authenticate_and_get_refresh_token() -> Result<String, AuthError> {
     let http_client = create_http_client()?;
-    let initial_tokens = get_initial_tokens(&http_client)?;
-    Ok(initial_tokens.refresh_token)
-}
-
-/// Converts a refresh token into a JCP access token.
-///
-/// This function:
-/// 1. Uses the refresh token to get a fresh access token
-/// 2. Fetches organization info from JCP
-/// 3. Switches the token audience to get a JCP-scoped token
-///
-/// Use this with a refresh token obtained from `login()`.
-pub fn get_access_token(refresh_token: &str) -> Result<String, AuthError> {
-    let http_client = create_http_client()?;
-
-    // Refresh to get a new access token
-    let access_token = refresh_access_token(&http_client, refresh_token)?;
-
-    // Get organization info
-    let org_info = get_org_info(&http_client, &access_token)?;
-
-    // Switch token audience for JCP access
-    let jcp_token = switch_token_audience(&http_client, refresh_token, &org_info)?;
-
-    Ok(jcp_token)
-}
-
-/// Authenticates the user via OAuth and returns a JCP access token.
-///
-/// This is a convenience function that combines `login()` and `get_access_token()`.
-/// It performs the full authentication flow in one call.
-///
-/// This function performs the following steps:
-/// 1. Opens a browser for user authentication
-/// 2. Receives the authorization code via local callback server
-/// 3. Exchanges the code for initial tokens
-/// 4. Fetches organization info from JCP
-/// 5. Switches the token audience to get a JCP-scoped token
-pub fn authenticate() -> Result<String, AuthError> {
-    let http_client = create_http_client()?;
-
-    // Step 1-3: Get authorization code via browser flow and exchange for tokens
-    let initial_tokens = get_initial_tokens(&http_client)?;
-
-    // Step 4: Get organization info
-    let org_info = get_org_info(&http_client, &initial_tokens.access_token)?;
-
-    // Step 5: Switch token audience for JCP access
-    let jcp_token = switch_token_audience(&http_client, &initial_tokens.refresh_token, &org_info)?;
-
-    Ok(jcp_token)
-}
-
-/// Creates an HTTP client configured for OAuth operations.
-fn create_http_client() -> Result<Client, AuthError> {
-    Ok(ClientBuilder::new()
-        .redirect(Policy::none()) // Disable redirects to prevent SSRF
-        .build()?)
-}
-
-/// Starts the OAuth browser flow, waits for the authorization code, and exchanges it for tokens.
-fn get_initial_tokens(http_client: &Client) -> Result<InitialTokens, AuthError> {
+    let http_client: &Client = &http_client;
     // Start local callback server
     let server = Server::http("localhost:0").map_err(|e| AuthError::ServerStart(e.into()))?;
 
@@ -161,18 +92,39 @@ fn get_initial_tokens(http_client: &Client) -> Result<InitialTokens, AuthError> 
         .request(http_client)
         .map_err(|e| AuthError::TokenExchange(e.to_string()))?;
 
-    let access_token = token_response.access_token().secret().to_string();
-
-    let refresh_token = token_response
+    Ok(token_response
         .refresh_token()
         .ok_or(AuthError::MissingRefreshToken)?
         .secret()
-        .to_string();
+        .to_string())
+}
 
-    Ok(InitialTokens {
-        access_token,
-        refresh_token,
-    })
+/// Converts a refresh token into a JCP access token.
+///
+/// This function:
+/// 1. Uses the refresh token to get a fresh access token
+/// 2. Fetches organization info from JCP
+/// 3. Switches the token audience to get a JCP-scoped token
+///
+/// Use this with a refresh token obtained from [`authenticate_and_get_refresh_token()`].
+pub fn get_access_token(refresh_token: &str) -> Result<String, AuthError> {
+    let http_client = create_http_client()?;
+
+    // Refresh to get a new access token
+    let access_token = refresh_access_token(&http_client, refresh_token)?;
+
+    // Get organization info
+    let org_info = get_org_info(&http_client, &access_token)?;
+
+    // Switch token audience for JCP access
+    switch_token_audience(&http_client, refresh_token, &org_info)
+}
+
+/// Creates an HTTP client configured for OAuth operations.
+fn create_http_client() -> Result<Client, AuthError> {
+    Ok(ClientBuilder::new()
+        .redirect(Policy::none()) // Disable redirects to prevent SSRF
+        .build()?)
 }
 
 /// Refreshes an access token using a refresh token.
@@ -392,10 +344,6 @@ pub enum AuthError {
     InvalidUrl(#[from] oauth2::url::ParseError),
 }
 
-// =============================================================================
-// Response Types
-// =============================================================================
-
 #[derive(Deserialize)]
 struct OAuthTokenResponse {
     #[serde(rename = "access_token")]
@@ -412,16 +360,6 @@ struct JcpTokenClaims {
 struct Organization {
     #[serde(rename = "orgId")]
     id: String,
-}
-
-// =============================================================================
-// Internal Types
-// =============================================================================
-
-/// Tokens received after initial OAuth exchange
-struct InitialTokens {
-    access_token: String,
-    refresh_token: String,
 }
 
 /// Organization info retrieved from JCP
