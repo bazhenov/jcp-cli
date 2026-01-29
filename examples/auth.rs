@@ -1,7 +1,7 @@
-use acp_jcp::auth::authenticate_get_token;
+use acp_jcp::auth::authenticate;
 
 pub fn main() {
-    let code = authenticate_get_token().unwrap();
+    let token = authenticate().unwrap();
     println!("=== Authentication Successful ===\n");
-    println!("Access Token:\n  {}\n", code);
+    println!("Access Token:\n  {}\n", token);
 }

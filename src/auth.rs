@@ -1,53 +1,104 @@
 use jwt::Token;
 use oauth2::{
-    AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge, RedirectUrl,
-    Scope, TokenResponse, TokenUrl, basic::BasicClient,
+    AuthUrl, AuthorizationCode, ClientId, CsrfToken, PkceCodeChallenge, RedirectUrl, Scope,
+    TokenResponse, TokenUrl, basic::BasicClient,
 };
-use reqwest::redirect::Policy;
-use serde::{Deserialize, de::DeserializeOwned};
+use reqwest::{
+    blocking::{Client, ClientBuilder},
+    redirect::Policy,
+};
+use serde::Deserialize;
 use serde_json::Value;
-use std::{collections::BTreeMap, error::Error};
+use thiserror::Error;
 use tiny_http::{Response, Server};
 use url::Url;
+
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// Base URL for JetBrains OAuth provider
+const OAUTH_BASE_URL: &str = "https://public.aip.oauth.intservices.aws.intellij.net";
+
+/// OAuth client ID for AIR
+const CLIENT_ID: &str = "air";
+
+/// JetBrains Cloud Platform API base URL
+const JCP_API_URL: &str = "https://api.stgn.jetbrainscloud.com";
+
+/// Agent Spawner audience for upgrading OAuth access token
+const JCP_AS_AUDIENCE: &str = "jcp-agent-spawner";
 
 /// The expected callback path for OAuth redirect
 const CALLBACK_PATH: &str = "/space/auth";
 
-pub fn authenticate_get_token() -> Result<String, Box<dyn Error + Send + Sync>> {
-    // Load configuration
-    let base_url = "https://public.aip.oauth.intservices.aws.intellij.net";
-    let client_id = "air";
-    let client_secret: Option<String> = None;
-    let auth_url = format!("{}/oauth2/auth", base_url);
-    let token_url = format!("{}/oauth2/token", base_url);
+// =============================================================================
+// Public API
+// =============================================================================
 
-    // Start HTTP server on a random available port
-    let server = Server::http("localhost:0")?;
+/// Authenticates the user via OAuth and returns a JCP access token.
+///
+/// This function performs the following steps:
+/// 1. Opens a browser for user authentication
+/// 2. Receives the authorization code via local callback server
+/// 3. Exchanges the code for initial tokens
+/// 4. Fetches organization info from JCP
+/// 5. Switches the token audience to get a JCP-scoped token
+pub fn authenticate() -> Result<String, AuthError> {
+    let http_client = create_http_client()?;
+
+    // Step 1-3: Get authorization code via browser flow and exchange for tokens
+    let initial_tokens = get_initial_tokens(&http_client)?;
+
+    // Step 4: Get organization info
+    let org_info = get_org_info(&http_client, &initial_tokens.access_token)?;
+
+    // Step 5: Switch token audience for JCP access
+    let jcp_token = switch_token_audience(&http_client, &initial_tokens.refresh_token, &org_info)?;
+
+    Ok(jcp_token)
+}
+
+// =============================================================================
+// Private Functions
+// =============================================================================
+
+/// Creates an HTTP client configured for OAuth operations.
+fn create_http_client() -> Result<Client, AuthError> {
+    Ok(ClientBuilder::new()
+        .redirect(Policy::none()) // Disable redirects to prevent SSRF
+        .build()?)
+}
+
+/// Starts the OAuth browser flow, waits for the authorization code, and exchanges it for tokens.
+fn get_initial_tokens(http_client: &Client) -> Result<InitialTokens, AuthError> {
+    // Start local callback server
+    let server = Server::http("localhost:0").map_err(|e| AuthError::ServerStart(e.into()))?;
+
     let local_addr = server
         .server_addr()
         .to_ip()
-        .ok_or("Failed to get server address")?;
-    let local_port = local_addr.port();
+        .ok_or_else(|| AuthError::ServerStart("Failed to get server address".into()))?;
 
+    let local_port = local_addr.port();
     let redirect_url = format!("http://localhost:{}{}", local_port, CALLBACK_PATH);
 
-    // Create the OAuth2 client
-    let mut client = BasicClient::new(ClientId::new(client_id.to_string()))
+    // Configure OAuth client
+    let auth_url = format!("{}/oauth2/auth", OAUTH_BASE_URL);
+    let token_url = format!("{}/oauth2/token", OAUTH_BASE_URL);
+
+    let client = BasicClient::new(ClientId::new(CLIENT_ID.to_string()))
         .set_auth_uri(AuthUrl::new(auth_url)?)
-        .set_token_uri(TokenUrl::new(token_url.clone())?)
+        .set_token_uri(TokenUrl::new(token_url)?)
         .set_redirect_uri(RedirectUrl::new(redirect_url)?);
 
-    if let Some(secret) = &client_secret {
-        client = client.set_client_secret(ClientSecret::new(secret.clone()));
-    }
-
-    // Generate PKCE challenge (recommended for all clients, required for public clients)
+    // Generate PKCE challenge
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
 
-    // Generate the authorization URL
+    // Build authorization URL with required scopes
     let (auth_url, csrf_token) = client
         .authorize_url(CsrfToken::new_random)
-        .add_scope(Scope::new("offline_access".to_string())) // for retrieving refresh_token
+        .add_scope(Scope::new("offline_access".to_string()))
         .add_scope(Scope::new("openid".to_string()))
         .add_scope(Scope::new("org-service".to_string()))
         .add_scope(Scope::new("jba".to_string()))
@@ -59,118 +110,102 @@ pub fn authenticate_get_token() -> Result<String, Box<dyn Error + Send + Sync>> 
     );
     eprintln!("\n  {}\n", auth_url);
 
-    // Try to open the browser
-    open::that(auth_url.to_string())?;
+    // Open browser
+    open::that(auth_url.to_string()).map_err(AuthError::BrowserOpen)?;
 
-    // Wait for the valid OAuth callback
+    // Wait for callback
     let code = read_authorization_code_from_callback(server, csrf_token)?;
 
-    // Exchange the authorization code for tokens
-    let http_client = reqwest::blocking::ClientBuilder::new()
-        .redirect(Policy::none()) // Disable redirects to prevent SSRF vulnerabilities
-        .build()?;
-
-    let jba_token = client
+    // Exchange code for tokens
+    let token_response = client
         .exchange_code(code)
         .set_pkce_verifier(pkce_verifier)
-        .request(&http_client)?;
+        .request(http_client)
+        .map_err(|e| AuthError::TokenExchange(e.to_string()))?;
 
-    let jba_access_token = jba_token.access_token().secret();
+    let access_token = token_response.access_token().secret().to_string();
 
-    eprintln!("Token: {:?}", jba_access_token);
-    let token: Token<Value, BTreeMap<String, Value>, _> =
-        Token::parse_unverified(&jba_access_token)?;
+    let refresh_token = token_response
+        .refresh_token()
+        .ok_or(AuthError::MissingRefreshToken)?
+        .secret()
+        .to_string();
 
-    eprintln!("Claims: {:?}", token.claims()["aud"]);
+    Ok(InitialTokens {
+        access_token,
+        refresh_token,
+    })
+}
 
-    let jcp_url = "https://api.stgn.jetbrainscloud.com";
-    let jcp_response = http_client
-        .get(format!("{}/org/orgsuserinfo", jcp_url))
-        .bearer_auth(jba_access_token)
+/// Fetches organization info from JCP using the access token.
+fn get_org_info(http_client: &Client, access_token: &str) -> Result<OrgInfo, AuthError> {
+    let response = http_client
+        .get(format!("{}/org/orgsuserinfo", JCP_API_URL))
+        .bearer_auth(access_token)
         .header("Accept", "application/jwt")
         .send()?;
 
-    if jcp_response.status() != 200 {
-        return Err(format!(
-            "Non 200 response from JBA: {} - {}",
-            jcp_response.status(),
-            jcp_response.text()?
-        )
-        .into());
+    let status = response.status().as_u16();
+    if status != 200 {
+        return Err(AuthError::OrgInfoFetch {
+            status,
+            body: response.text().unwrap_or_default(),
+        });
     }
 
-    let jcp_raw_token = jcp_response.text()?;
-    eprintln!("---");
-    eprintln!("{}", &jcp_raw_token);
-    eprintln!("---");
-    let org_token: Token<Value, JcpToken, _> = Token::parse_unverified(&jcp_raw_token)?;
-    let org_token = org_token.claims();
+    let raw_token = response.text()?;
 
-    eprintln!("Org Token: {}", jcp_raw_token);
-    eprintln!("Org Claim: {:?}", org_token);
+    // Parse JWT to extract organization ID
+    let token: Token<Value, JcpTokenClaims, _> = Token::parse_unverified(&raw_token)?;
 
-    let org_id = &org_token
+    // There is no UI yet, so we just choosing first organisation
+    let org_id = token
+        .claims()
         .orgs
         .first()
-        .expect("At least one org expected")
-        .id;
+        .ok_or(AuthError::NoOrganization)?
+        .id
+        .clone();
+
+    Ok(OrgInfo { org_id, raw_token })
+}
+
+/// Switches the token audience to get a JCP-scoped access token.
+fn switch_token_audience(
+    http_client: &Client,
+    refresh_token: &str,
+    org_info: &OrgInfo,
+) -> Result<String, AuthError> {
+    let token_url = format!("{}/oauth2/token", OAUTH_BASE_URL);
+
     let response = http_client
-        .post(token_url)
-        //        .basic_auth(client_id, client_secret)
-        //        .bearer_auth(jba_access_token)
+        .post(&token_url)
         .form(&[
             ("grant_type", "switch_audience"),
-            ("refresh_token", jba_token.refresh_token().unwrap().secret()),
-            ("client_id", client_id),
-            ("audience", "jcp-agent-spawner"),
-            ("org_id", org_id),
-            ("orgs_user_info", jcp_raw_token.as_str()),
+            ("refresh_token", refresh_token),
+            ("client_id", CLIENT_ID),
+            ("audience", JCP_AS_AUDIENCE),
+            ("org_id", &org_info.org_id),
+            ("orgs_user_info", &org_info.raw_token),
         ])
         .send()?;
 
-    if response.status() != 200 {
-        return Err(format!(
-            "Non 200 response when switching JBA audience: {} - {}",
-            response.status(),
-            response.text()?
-        )
-        .into());
+    let status = response.status().as_u16();
+    if status != 200 {
+        return Err(AuthError::AudienceSwitch {
+            status,
+            body: response.text().unwrap_or_default(),
+        });
     }
 
-    let token_result = response.json::<OAuthToken>()?;
-
-    eprintln!("TOKEN: {}", token_result.accessToken);
-
-    //    eprintln!("SWA Token: {}", token_result.accessToken);
-
-    Ok(token_result.accessToken)
+    Ok(response.json::<OAuthTokenResponse>()?.access_token)
 }
 
-#[derive(Deserialize)]
-struct OAuthToken {
-    #[serde(rename = "access_token")]
-    accessToken: String,
-}
-
-#[derive(Deserialize, Debug)]
-struct JcpToken {
-    #[serde(rename = "aud")]
-    audience: Vec<String>,
-
-    #[serde(rename = "orgMemberships")]
-    orgs: Vec<Organisation>,
-}
-
-#[derive(Deserialize, Debug)]
-struct Organisation {
-    #[serde(rename = "orgId")]
-    id: String,
-}
-
+/// Waits for the OAuth callback and extracts the authorization code.
 fn read_authorization_code_from_callback(
     server: Server,
     csrf_token: CsrfToken,
-) -> Result<AuthorizationCode, Box<dyn Error + Send + Sync>> {
+) -> Result<AuthorizationCode, AuthError> {
     loop {
         let Ok(request) = server.recv() else {
             continue;
@@ -184,7 +219,7 @@ fn read_authorization_code_from_callback(
             Ok(url) => url,
             Err(e) => {
                 let description = format!("Failed to parse callback URL: {}", e);
-                let response = Response::from_string(description).with_status_code(400);
+                let response = Response::from_string(&description).with_status_code(400);
                 let _ = request.respond(response);
                 continue;
             }
@@ -198,16 +233,16 @@ fn read_authorization_code_from_callback(
         }
 
         // Extract authorization code
-        let Some(code) = read_authorization_code(&parsed_url) else {
+        let Some(code) = extract_query_param(&parsed_url, "code") else {
             // Check if there's an error parameter
-            if let Some(error) = read_get_param(&parsed_url, "error") {
+            if let Some(error) = extract_query_param(&parsed_url, "error") {
                 let error_desc =
-                    read_get_param(&parsed_url, "error_description").unwrap_or_default();
+                    extract_query_param(&parsed_url, "error_description").unwrap_or_default();
 
-                let error_msg = format!("OAuth error: {} - {}", error, error_desc);
+                let error_msg = format!("{} - {}", error, error_desc);
                 let response = Response::from_string(&error_msg).with_status_code(400);
                 let _ = request.respond(response);
-                return Err(error_msg.into());
+                return Err(AuthError::OAuthCallback(error_msg));
             }
 
             let response = Response::from_string("Bad Request: missing code").with_status_code(400);
@@ -215,16 +250,15 @@ fn read_authorization_code_from_callback(
             continue;
         };
 
-        // Extract state parameter
-        let Some(state) = read_get_param(&parsed_url, "state").map(CsrfToken::new) else {
+        // Extract and verify state parameter (CSRF protection)
+        let Some(state) = extract_query_param(&parsed_url, "state") else {
             let response =
                 Response::from_string("Bad Request: missing state").with_status_code(400);
             let _ = request.respond(response);
             continue;
         };
 
-        // Verify CSRF token
-        if state.secret() != csrf_token.secret() {
+        if state != *csrf_token.secret() {
             let response =
                 Response::from_string("Bad Request: invalid state").with_status_code(400);
             let _ = request.respond(response);
@@ -243,20 +277,90 @@ fn read_authorization_code_from_callback(
         );
         let _ = request.respond(response);
 
-        return Ok(code);
+        return Ok(AuthorizationCode::new(code));
     }
 }
 
-fn read_get_param(parsed_url: &Url, param_name: &str) -> Option<String> {
-    parsed_url
-        .query_pairs()
+/// Extracts a query parameter from a URL.
+fn extract_query_param(url: &Url, param_name: &str) -> Option<String> {
+    url.query_pairs()
         .find(|(key, _)| key == param_name)
         .map(|(_, value)| value.into_owned())
 }
 
-fn read_authorization_code(parsed_url: &Url) -> Option<AuthorizationCode> {
-    parsed_url
-        .query_pairs()
-        .find(|(key, _)| key == "code")
-        .map(|(_, value)| AuthorizationCode::new(value.into_owned()))
+// =============================================================================
+// Error Types
+// =============================================================================
+
+#[derive(Error, Debug)]
+pub enum AuthError {
+    #[error("Failed to start local callback server: {0}")]
+    ServerStart(#[source] Box<dyn std::error::Error + Send + Sync>),
+
+    #[error("Failed to open browser for authentication: {0}")]
+    BrowserOpen(#[source] std::io::Error),
+
+    #[error("OAuth callback error: {0}")]
+    OAuthCallback(String),
+
+    #[error("Failed to exchange authorization code for tokens: {0}")]
+    TokenExchange(String),
+
+    #[error("Failed to parse JWT token: {0}")]
+    JwtError(#[from] jwt::Error),
+
+    #[error("Missing refresh token in OAuth response")]
+    MissingRefreshToken,
+
+    #[error("Failed to fetch organization info: {status} - {body}")]
+    OrgInfoFetch { status: u16, body: String },
+
+    #[error("No organization found in user's account")]
+    NoOrganization,
+
+    #[error("Failed to switch token audience: {status} - {body}")]
+    AudienceSwitch { status: u16, body: String },
+
+    #[error("HTTP request failed: {0}")]
+    ReqwestRequest(#[from] reqwest::Error),
+    #[error("Invalid URL: {0}")]
+    InvalidUrl(#[from] oauth2::url::ParseError),
+}
+
+// =============================================================================
+// Response Types
+// =============================================================================
+
+#[derive(Deserialize)]
+struct OAuthTokenResponse {
+    #[serde(rename = "access_token")]
+    access_token: String,
+}
+
+#[derive(Deserialize, Debug)]
+struct JcpTokenClaims {
+    #[serde(rename = "orgMemberships")]
+    orgs: Vec<Organization>,
+}
+
+#[derive(Deserialize, Debug)]
+struct Organization {
+    #[serde(rename = "orgId")]
+    id: String,
+}
+
+// =============================================================================
+// Internal Types
+// =============================================================================
+
+/// Tokens received after initial OAuth exchange
+struct InitialTokens {
+    access_token: String,
+    refresh_token: String,
+}
+
+/// Organization info retrieved from JCP
+struct OrgInfo {
+    org_id: String,
+    raw_token: String,
 }

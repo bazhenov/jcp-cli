@@ -212,7 +212,6 @@ where
         tokio::select! {
             msg = self.downlink.recv() => {
                 if let Some(msg) = msg? {
-                    eprint!("=== Client -> Server ===\n{:?}\n", msg);
                     self.traffic_log.write(msg.clone()).await?;
                     self.handle_client_message(msg).await?;
                 }
@@ -220,7 +219,6 @@ where
             }
             msg = self.uplink.recv() => {
                 if let Some(msg) = msg? {
-                    eprint!("=== Server -> Client ===\n{:?}\n", msg);
                     self.traffic_log.write(msg.clone()).await?;
                     self.downlink.send(msg).await?;
                 }

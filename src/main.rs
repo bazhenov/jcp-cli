@@ -1,5 +1,5 @@
 use acp_jcp::{
-    Adapter, Config, IoTransport, TrafficLog, WebSocketTransport, auth::authenticate_get_token,
+    Adapter, Config, IoTransport, TrafficLog, WebSocketTransport, auth::authenticate,
 };
 use dotenv::dotenv;
 use futures_util::StreamExt;
@@ -28,7 +28,7 @@ async fn main() {
         if let Some(access_key) = env::var("JBA_ACCESS_TOKEN").ok() {
             access_key
         } else {
-            authenticate_get_token().unwrap()
+            authenticate().unwrap()
         }
     })
     .await

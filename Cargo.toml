@@ -19,6 +19,7 @@ open = "5"
 url = "2"
 tiny_http = "0.12"
 jwt = "0.16.0"
+thiserror = "2"
 
 [dev-dependencies]
 drop-check = { git = "https://github.com/bazhenov/drop-check" }
