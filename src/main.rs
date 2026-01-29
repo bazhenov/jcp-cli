@@ -1,16 +1,13 @@
 use acp_jcp::{
     Adapter, Config, IoTransport, TrafficLog, WebSocketTransport,
-    auth::{authenticate_and_get_refresh_token, get_access_token},
+    auth::{get_access_token, login},
     keychain::{delete_refresh_token, get_refresh_token, store_refresh_token},
 };
 use clap::{Parser, Subcommand};
 use dotenv::dotenv;
 use futures_util::StreamExt;
 use std::{env, process};
-use tokio::{
-    io::{stdin, stdout},
-    task::spawn_blocking,
-};
+use tokio::io::{stdin, stdout};
 use tokio_tungstenite::connect_async;
 use tungstenite::client::IntoClientRequest;
 
@@ -39,25 +36,20 @@ async fn main() {
 
     match cli.command {
         Some(Commands::Login) => {
-            // Run login in blocking context since it uses synchronous HTTP
-            spawn_blocking(|| {
-                eprintln!("Starting authentication...");
-                match authenticate_and_get_refresh_token() {
-                    Ok(refresh_token) => {
-                        if let Err(e) = store_refresh_token(&refresh_token) {
-                            eprintln!("Failed to store refresh token in keychain: {}", e);
-                            process::exit(1);
-                        }
-                        eprintln!("Login successful!");
-                    }
-                    Err(e) => {
-                        eprintln!("Login failed: {}", e);
+            eprintln!("Starting authentication...");
+            match login().await {
+                Ok(refresh_token) => {
+                    if let Err(e) = store_refresh_token(&refresh_token) {
+                        eprintln!("Failed to store refresh token in keychain: {}", e);
                         process::exit(1);
                     }
+                    eprintln!("Login successful!");
                 }
-            })
-            .await
-            .unwrap();
+                Err(e) => {
+                    eprintln!("Login failed: {}", e);
+                    process::exit(1);
+                }
+            }
         }
         Some(Commands::Logout) => {
             delete_refresh_token().unwrap();
@@ -76,19 +68,8 @@ async fn run_adapter() {
         .unwrap_or("wss://api.stgn.jetbrains.cloud/agent-spawner/acp".into());
     let traffic_log = TrafficLog::new(env::var("TRAFFIC_LOG").ok()).await.unwrap();
 
-    // First check if access token is provided directly via env var
-    let jba_access_token = if let Ok(access_key) = env::var("JBA_ACCESS_TOKEN") {
-        access_key
-    } else {
-        // Try to get refresh token from keychain and upgrade it
-        let Some(refresh_token) = get_refresh_token().unwrap() else {
-            eprintln!("No refresh token found");
-            eprintln!("Please run `acp-jcp login` to authenticate.");
-            return;
-        };
-        spawn_blocking(move || get_access_token(&refresh_token).unwrap())
-            .await
-            .unwrap()
+    let Some(jba_access_token) = authenticate().await else {
+        return;
     };
 
     let mut request = jcp_url.into_client_request().unwrap();
@@ -119,4 +100,26 @@ async fn run_adapter() {
         .expect("Unable to handle message")
         .is_some()
     {}
+}
+
+async fn authenticate() -> Option<String> {
+    let jba_access_token = if let Ok(access_key) = env::var("JBA_ACCESS_TOKEN") {
+        access_key
+    } else {
+        // Try to get refresh token from keychain and upgrade it
+        let Some(refresh_token) = get_refresh_token().unwrap() else {
+            eprintln!("No refresh token found");
+            eprintln!("Please run `acp-jcp login` to authenticate.");
+            return None;
+        };
+        match get_access_token(&refresh_token).await {
+            Ok(token) => token,
+            Err(e) => {
+                eprintln!("Failed to get access token: {}", e);
+                eprintln!("Please run `acp-jcp login` to re-authenticate.");
+                process::exit(1);
+            }
+        }
+    };
+    Some(jba_access_token)
 }
