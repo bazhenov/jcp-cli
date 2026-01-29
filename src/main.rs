@@ -1,7 +1,7 @@
 use acp_jcp::{
     Adapter, Config, IoTransport, TrafficLog, WebSocketTransport,
-    auth::{get_access_token, login},
-    keychain::{get_refresh_token, store_refresh_token},
+    auth::{authenticate_and_get_refresh_token, get_access_token},
+    keychain::{delete_refresh_token, get_refresh_token, store_refresh_token},
 };
 use clap::{Parser, Subcommand};
 use dotenv::dotenv;
@@ -26,6 +26,9 @@ struct Cli {
 enum Commands {
     /// Authenticate via browser and store refresh token in keychain
     Login,
+
+    /// Discard local refresh token
+    Logout,
 }
 
 #[tokio::main]
@@ -39,13 +42,13 @@ async fn main() {
             // Run login in blocking context since it uses synchronous HTTP
             spawn_blocking(|| {
                 eprintln!("Starting authentication...");
-                match login() {
+                match authenticate_and_get_refresh_token() {
                     Ok(refresh_token) => {
                         if let Err(e) = store_refresh_token(&refresh_token) {
                             eprintln!("Failed to store refresh token in keychain: {}", e);
                             process::exit(1);
                         }
-                        eprintln!("Login successful! Refresh token stored in keychain.");
+                        eprintln!("Login successful!");
                     }
                     Err(e) => {
                         eprintln!("Login failed: {}", e);
@@ -56,10 +59,11 @@ async fn main() {
             .await
             .unwrap();
         }
-        None => {
-            // Default behavior: run the adapter
-            run_adapter().await;
+        Some(Commands::Logout) => {
+            delete_refresh_token().unwrap();
+            eprintln!("Logout successful!");
         }
+        None => run_adapter().await,
     }
 }
 

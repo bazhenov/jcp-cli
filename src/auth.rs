@@ -46,7 +46,7 @@ const CALLBACK_PATH: &str = "/space/auth";
 ///
 /// The refresh token can be stored (e.g., in keychain) and used with
 /// `get_access_token()` to obtain access tokens without re-authentication.
-pub fn login() -> Result<String, AuthError> {
+pub fn authenticate_and_get_refresh_token() -> Result<String, AuthError> {
     let http_client = create_http_client()?;
     let initial_tokens = get_initial_tokens(&http_client)?;
     Ok(initial_tokens.refresh_token)
