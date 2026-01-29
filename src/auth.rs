@@ -173,18 +173,29 @@ fn get_org_info(http_client: &Client, access_token: &str) -> Result<OrgInfo, Aut
     let token: Token<Value, JcpTokenClaims, _> = Token::parse_unverified(&raw_token)?;
 
     // There is no UI yet, so we just choosing first organisation
-    let org_id = token
+    let organization = token
         .claims()
         .orgs
         .first()
-        .ok_or(AuthError::NoOrganization)?
+        .ok_or(AuthError::NoOrganization)?;
+    let org_id = organization.id.clone();
+    let workspace_id = organization
+        .workspaces
+        .first()
+        .ok_or(AuthError::NoWorkspace)?
         .id
         .clone();
 
-    Ok(OrgInfo { org_id, raw_token })
+    Ok(OrgInfo {
+        org_id,
+        raw_token,
+        workspace_id,
+    })
 }
 
 /// Switches the token audience to get a JCP-scoped access token.
+///
+/// https://youtrack.jetbrains.com/projects/JCP/articles/JCP-A-204/Refresh-Token-Flow#org-access-token
 fn switch_token_audience(
     http_client: &Client,
     refresh_token: &str,
@@ -201,6 +212,7 @@ fn switch_token_audience(
             ("audience", JCP_AS_AUDIENCE),
             ("org_id", &org_info.org_id),
             ("orgs_user_info", &org_info.raw_token),
+            ("workspace_id", &org_info.workspace_id),
         ])
         .send()?;
 
@@ -332,6 +344,9 @@ pub enum AuthError {
     #[error("No organization found in user's account")]
     NoOrganization,
 
+    #[error("No workspace found in user's organization")]
+    NoWorkspace,
+
     #[error("Failed to switch token audience: {status} - {body}")]
     AudienceSwitch { status: u16, body: String },
 
@@ -356,14 +371,24 @@ struct JcpTokenClaims {
     orgs: Vec<Organization>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 struct Organization {
     #[serde(rename = "orgId")]
+    id: String,
+
+    #[serde(rename = "workspaces")]
+    workspaces: Vec<Workspace>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct Workspace {
+    #[serde(rename = "id")]
     id: String,
 }
 
 /// Organization info retrieved from JCP
 struct OrgInfo {
     org_id: String,
+    workspace_id: String,
     raw_token: String,
 }
