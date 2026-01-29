@@ -14,6 +14,7 @@ use tokio::{
 use tungstenite::{Message, Utf8Bytes};
 
 pub mod auth;
+pub mod keychain;
 
 /// A bidirectional transport for JSON-RPC messages.
 ///

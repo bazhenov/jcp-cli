@@ -36,7 +36,49 @@ const CALLBACK_PATH: &str = "/space/auth";
 // Public API
 // =============================================================================
 
+/// Performs OAuth browser login flow and returns a refresh token.
+///
+/// This function:
+/// 1. Opens a browser for user authentication
+/// 2. Receives the authorization code via local callback server
+/// 3. Exchanges the code for tokens
+/// 4. Returns the refresh token for later use
+///
+/// The refresh token can be stored (e.g., in keychain) and used with
+/// `get_access_token()` to obtain access tokens without re-authentication.
+pub fn login() -> Result<String, AuthError> {
+    let http_client = create_http_client()?;
+    let initial_tokens = get_initial_tokens(&http_client)?;
+    Ok(initial_tokens.refresh_token)
+}
+
+/// Converts a refresh token into a JCP access token.
+///
+/// This function:
+/// 1. Uses the refresh token to get a fresh access token
+/// 2. Fetches organization info from JCP
+/// 3. Switches the token audience to get a JCP-scoped token
+///
+/// Use this with a refresh token obtained from `login()`.
+pub fn get_access_token(refresh_token: &str) -> Result<String, AuthError> {
+    let http_client = create_http_client()?;
+
+    // Refresh to get a new access token
+    let access_token = refresh_access_token(&http_client, refresh_token)?;
+
+    // Get organization info
+    let org_info = get_org_info(&http_client, &access_token)?;
+
+    // Switch token audience for JCP access
+    let jcp_token = switch_token_audience(&http_client, refresh_token, &org_info)?;
+
+    Ok(jcp_token)
+}
+
 /// Authenticates the user via OAuth and returns a JCP access token.
+///
+/// This is a convenience function that combines `login()` and `get_access_token()`.
+/// It performs the full authentication flow in one call.
 ///
 /// This function performs the following steps:
 /// 1. Opens a browser for user authentication
@@ -58,10 +100,6 @@ pub fn authenticate() -> Result<String, AuthError> {
 
     Ok(jcp_token)
 }
-
-// =============================================================================
-// Private Functions
-// =============================================================================
 
 /// Creates an HTTP client configured for OAuth operations.
 fn create_http_client() -> Result<Client, AuthError> {
@@ -135,6 +173,30 @@ fn get_initial_tokens(http_client: &Client) -> Result<InitialTokens, AuthError> 
         access_token,
         refresh_token,
     })
+}
+
+/// Refreshes an access token using a refresh token.
+fn refresh_access_token(http_client: &Client, refresh_token: &str) -> Result<String, AuthError> {
+    let token_url = format!("{}/oauth2/token", OAUTH_BASE_URL);
+
+    let response = http_client
+        .post(&token_url)
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", CLIENT_ID),
+        ])
+        .send()?;
+
+    let status = response.status().as_u16();
+    if status != 200 {
+        return Err(AuthError::TokenRefresh {
+            status,
+            body: response.text().unwrap_or_default(),
+        });
+    }
+
+    Ok(response.json::<OAuthTokenResponse>()?.access_token)
 }
 
 /// Fetches organization info from JCP using the access token.
@@ -320,6 +382,9 @@ pub enum AuthError {
 
     #[error("Failed to switch token audience: {status} - {body}")]
     AudienceSwitch { status: u16, body: String },
+
+    #[error("Failed to refresh access token: {status} - {body}")]
+    TokenRefresh { status: u16, body: String },
 
     #[error("HTTP request failed: {0}")]
     ReqwestRequest(#[from] reqwest::Error),
