@@ -20,7 +20,7 @@ async fn main() {
         env::var("ANTHROPIC_KEY").expect("ANTHROPIC_KEY env variable should be configured");
     let jcp_url = env::var("JCP_URL")
         .ok()
-        .unwrap_or("wss://api.stgn.jetbrainscloud.com/agent-spawner/acp".into());
+        .unwrap_or("wss://api.stgn.jetbrains.cloud/agent-spawner/acp".into());
     let traffic_log = TrafficLog::new(env::var("TRAFFIC_LOG").ok()).await.unwrap();
 
     // reading authentication is a blocking process

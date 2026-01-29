@@ -210,15 +210,21 @@ where
     /// Returns `None` when both channels are closed (end of communication).
     pub async fn handle_next_message(&mut self) -> io::Result<Option<()>> {
         tokio::select! {
-            Ok(Some(msg)) = self.downlink.recv() => {
-                eprint!("=== Client -> Server ===\n{:?}\n", msg);
-                self.traffic_log.write(msg.clone()).await?;
-                self.handle_client_message(msg).await?;
+            msg = self.downlink.recv() => {
+                if let Some(msg) = msg? {
+                    eprint!("=== Client -> Server ===\n{:?}\n", msg);
+                    self.traffic_log.write(msg.clone()).await?;
+                    self.handle_client_message(msg).await?;
+                }
+
             }
-            Ok(Some(msg)) = self.uplink.recv() => {
-                eprint!("=== Server -> Client ===\n{:?}\n", msg);
-                self.traffic_log.write(msg.clone()).await?;
-                self.downlink.send(msg).await?;
+            msg = self.uplink.recv() => {
+                if let Some(msg) = msg? {
+                    eprint!("=== Server -> Client ===\n{:?}\n", msg);
+                    self.traffic_log.write(msg.clone()).await?;
+                    self.downlink.send(msg).await?;
+                }
+
             }
             else => return Ok(None),
         }
