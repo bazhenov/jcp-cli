@@ -91,7 +91,7 @@ pub async fn login() -> Result<String, AuthError> {
         .set_pkce_verifier(pkce_verifier)
         .request_async(&http_client)
         .await
-        .map_err(|e| AuthError::TokenExchange(e.to_string()))?;
+        .map_err(|e| AuthError::TokenExchange(e.into()))?;
 
     token_response
         .refresh_token()
@@ -274,7 +274,7 @@ fn read_authorization_code_from_callback(
                 let error_msg = format!("{} - {}", error, error_desc);
                 let response = Response::from_string(&error_msg).with_status_code(400);
                 let _ = request.respond(response);
-                return Err(AuthError::OAuthCallback(error_msg));
+                return Err(AuthError::OAuthServer(error_msg));
             }
 
             let response = Response::from_string("Bad Request: missing code").with_status_code(400);
@@ -332,11 +332,11 @@ pub enum AuthError {
     #[error("Failed to open browser for authentication: {0}")]
     BrowserOpen(#[source] std::io::Error),
 
-    #[error("OAuth callback error: {0}")]
-    OAuthCallback(String),
+    #[error("OAuth server returned an error: {0}")]
+    OAuthServer(String),
 
     #[error("Failed to exchange authorization code for tokens: {0}")]
-    TokenExchange(String),
+    TokenExchange(#[source] Box<dyn std::error::Error + Send + Sync>),
 
     #[error("Failed to parse JWT token: {0}")]
     JwtError(#[from] jwt::Error),
@@ -361,6 +361,7 @@ pub enum AuthError {
 
     #[error("HTTP request failed: {0}")]
     ReqwestRequest(#[from] reqwest::Error),
+    
     #[error("Invalid URL: {0}")]
     InvalidUrl(#[from] oauth2::url::ParseError),
 }
