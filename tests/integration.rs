@@ -38,9 +38,9 @@ async fn test_adapter_forwards_initialize_request_to_server() {
     assert_eq!(recv_id, request_id);
     assert!(matches!(recv_request, ClientRequest::InitializeRequest(_)));
 
-    let initalize_response = InitializeResponse::new(ProtocolVersion::V1);
+    let initialize_response = InitializeResponse::new(ProtocolVersion::V1);
     // Server sends response
-    let response = AgentResponse::InitializeResponse(initalize_response.clone());
+    let response = AgentResponse::InitializeResponse(initialize_response.clone());
     harness.server_reply(recv_id, response).await;
 
     // Process the server response
@@ -53,7 +53,7 @@ async fn test_adapter_forwards_initialize_request_to_server() {
     };
 
     assert_eq!(id, request_id);
-    assert_eq!(result, initalize_response);
+    assert_eq!(result, initialize_response);
 }
 
 #[tokio::test]

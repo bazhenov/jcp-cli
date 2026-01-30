@@ -267,7 +267,7 @@ where
 
     /// Handle a message from the client (uplink: client -> server)
     async fn handle_client_message(&mut self, msg: JsonValue) -> io::Result<()> {
-        // This is ungly hack, but we need to serialize here back to string, otherwise
+        // This is ugly hack, but we need to serialize here back to string, otherwise
         // we can not use AgentSide::decode_request()
         let msg_str = msg.to_string();
         let rpc_msg: RawIncomingMessage<'_> =
@@ -345,7 +345,7 @@ fn to_io_invalid_data_err<E: Into<Box<dyn std::error::Error + Send + Sync>>>(e: 
 mod tests {
     use super::*;
     use agent_client_protocol::{AgentSide, ClientRequest, Side};
-    use drop_check::{IntersperceExt, cancelations};
+    use drop_check::{IntersperceExt, cancellations};
     use serde::de::DeserializeOwned;
     use serde_json::Value;
     use std::fmt::Debug;
@@ -431,7 +431,7 @@ mod tests {
             Box::pin(transport.recv())
         }
 
-        for (_, result) in cancelations(init, recv) {
+        for (_, result) in cancellations(init, recv) {
             assert_eq!(result.unwrap(), Some(expected.clone()));
         }
     }
