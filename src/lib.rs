@@ -156,7 +156,7 @@ pub struct Config {
     pub git_url: String,
     pub branch: String,
     pub revision: String,
-    pub jb_ai_token: String,
+    pub ai_platform_token: String,
     pub supports_user_git_auth_flow: bool,
 }
 
@@ -168,7 +168,7 @@ impl Config {
                 url: self.git_url.clone(),
                 revision: self.revision.clone(),
             },
-            jb_ai_token: self.jb_ai_token.clone(),
+            ai_platform_token: self.ai_platform_token.clone(),
             supports_user_git_auth_flow: self.supports_user_git_auth_flow,
         }
     }
@@ -180,7 +180,7 @@ pub struct NewSessionMeta {
     pub remote: NewSessionRemote,
 
     #[serde(rename = "jbAiToken")]
-    pub jb_ai_token: String,
+    pub ai_platform_token: String,
 
     #[serde(rename = "supportsUserGitAuthFlow")]
     pub supports_user_git_auth_flow: bool,
@@ -258,7 +258,6 @@ where
                     self.traffic_log.write(msg.clone()).await?;
                     self.downlink.send(msg).await?;
                 }
-
             }
             else => return Ok(None),
         }
@@ -348,8 +347,7 @@ mod tests {
     use drop_check::{IntersperceExt, cancellations};
     use serde::de::DeserializeOwned;
     use serde_json::Value;
-    use std::fmt::Debug;
-    use std::io::Cursor;
+    use std::{fmt::Debug, io::Cursor};
 
     #[test]
     fn test_new_session_meta_deserialization() {
@@ -369,7 +367,7 @@ mod tests {
                     url: "https://example.com/repo.git".to_string(),
                     revision: "18adf27d36912b2e255c71327146ac21116e232f".to_string(),
                 },
-                jb_ai_token: "test_token".to_string(),
+                ai_platform_token: "test_token".to_string(),
                 supports_user_git_auth_flow: false,
             },
         );

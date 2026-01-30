@@ -17,7 +17,7 @@ fn test_config() -> Config {
         git_url: TEST_GIT_URL.into(),
         branch: TEST_BRANCH.into(),
         revision: TEST_REVISION.into(),
-        jb_ai_token: TEST_TOKEN.into(),
+        ai_platform_token: TEST_TOKEN.into(),
         supports_user_git_auth_flow: false,
     }
 }

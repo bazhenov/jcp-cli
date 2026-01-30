@@ -61,16 +61,14 @@ async fn main() {
 
 async fn run_adapter() {
     let git_url = env::var("GIT_URL").expect("GIT_URL env variable should be configured");
-    let anthropic_key =
-        env::var("ANTHROPIC_KEY").expect("ANTHROPIC_KEY env variable should be configured");
+    let ai_platform_token =
+        env::var("AI_PLATFORM_TOKEN").expect("AI_PLATFORM_TOKEN env variable should be configured");
     let jcp_url = env::var("JCP_URL")
         .ok()
         .unwrap_or("wss://api.stgn.jetbrains.cloud/agent-spawner/acp".into());
     let traffic_log = TrafficLog::new(env::var("TRAFFIC_LOG").ok()).await.unwrap();
 
-    let Some(jba_access_token) = authenticate().await else {
-        return;
-    };
+    let jba_access_token = authenticate().await;
 
     let mut request = jcp_url.into_client_request().unwrap();
     request.headers_mut().insert(
@@ -82,7 +80,7 @@ async fn run_adapter() {
         git_url,
         branch: "main".into(),
         revision: "main".into(),
-        jb_ai_token: anthropic_key,
+        ai_platform_token,
         supports_user_git_auth_flow: false,
     };
 
@@ -102,15 +100,15 @@ async fn run_adapter() {
     {}
 }
 
-async fn authenticate() -> Option<String> {
-    let jba_access_token = if let Ok(access_key) = env::var("JBA_ACCESS_TOKEN") {
+async fn authenticate() -> String {
+    if let Ok(access_key) = env::var("JBA_ACCESS_TOKEN") {
         access_key
     } else {
         // Try to get refresh token from keychain and upgrade it
         let Some(refresh_token) = get_refresh_token().unwrap() else {
             eprintln!("No refresh token found");
             eprintln!("Please run `acp-jcp login` to authenticate.");
-            return None;
+            process::exit(1);
         };
         match get_access_token(&refresh_token).await {
             Ok(token) => token,
@@ -120,6 +118,5 @@ async fn authenticate() -> Option<String> {
                 process::exit(1);
             }
         }
-    };
-    Some(jba_access_token)
+    }
 }
