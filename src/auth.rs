@@ -298,14 +298,9 @@ fn read_authorization_code_from_callback(
         }
 
         // Send success response to browser
-        let response = Response::from_string(
-            "<html><body>\
-             <h1>Authentication Successful!</h1>\
-             <p>You can close this window and return to the terminal.</p>\
-             </body></html>",
-        )
-        .with_header(
-            tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/html"[..]).unwrap(),
+        let response = Response::from_string(include_str!("auth_success.html")).with_header(
+            tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..])
+                .unwrap(),
         );
         let _ = request.respond(response);
 
