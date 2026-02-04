@@ -28,3 +28,7 @@ $ cargo install --path=.
   },
 },
 ```
+
+# Developing
+
+When running locally we're using file-backend for a storing secrets instead of platform keychain, because macOS keeps asking for a password on each recompile which significantly slows down the development process.

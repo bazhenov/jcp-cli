@@ -356,7 +356,7 @@ pub enum AuthError {
 
     #[error("HTTP request failed: {0}")]
     ReqwestRequest(#[from] reqwest::Error),
-    
+
     #[error("Invalid URL: {0}")]
     InvalidUrl(#[from] oauth2::url::ParseError),
 }

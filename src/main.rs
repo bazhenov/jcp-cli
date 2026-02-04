@@ -4,7 +4,7 @@ use futures_util::StreamExt;
 use jcp::{
     Adapter, Config, IoTransport, TrafficLog, WebSocketTransport,
     auth::{get_access_token, login},
-    keychain::{delete_refresh_token, get_refresh_token, store_refresh_token},
+    keychain::{self, SecretBackend},
 };
 use std::{env, process};
 use tokio::io::{stdin, stdout};
@@ -16,7 +16,7 @@ use tungstenite::client::IntoClientRequest;
 #[command(about = "ACP-JCP adapter for JetBrains Cloud Platform")]
 struct Cli {
     #[command(subcommand)]
-    command: Option<Commands>,
+    command: Commands,
 }
 
 #[derive(Subcommand)]
@@ -26,6 +26,9 @@ enum Commands {
 
     /// Discard local refresh token
     Logout,
+
+    /// Run ACP adapter
+    Acp,
 }
 
 #[tokio::main]
@@ -33,13 +36,14 @@ async fn main() {
     dotenv().ok();
 
     let cli = Cli::parse();
+    let keychain = keychain::platform_keychain();
 
     match cli.command {
-        Some(Commands::Login) => {
+        Commands::Login => {
             eprintln!("Starting authentication...");
             match login().await {
                 Ok(refresh_token) => {
-                    if let Err(e) = store_refresh_token(&refresh_token) {
+                    if let Err(e) = keychain.store_refresh_token(&refresh_token) {
                         eprintln!("Failed to store refresh token in keychain: {}", e);
                         process::exit(1);
                     }
@@ -51,15 +55,16 @@ async fn main() {
                 }
             }
         }
-        Some(Commands::Logout) => {
-            delete_refresh_token().unwrap();
+        Commands::Logout => {
+            keychain.delete_refresh_token().unwrap();
             eprintln!("Logout successful!");
         }
-        None => run_adapter().await,
+        Commands::Acp => run_adapter().await,
     }
 }
 
 async fn run_adapter() {
+    let keychain = keychain::platform_keychain();
     let git_url = env::var("GIT_URL").expect("GIT_URL env variable should be configured");
     let ai_platform_token =
         env::var("AI_PLATFORM_TOKEN").expect("AI_PLATFORM_TOKEN env variable should be configured");
@@ -68,7 +73,7 @@ async fn run_adapter() {
         .unwrap_or("wss://api.stgn.jetbrains.cloud/agent-spawner/acp".into());
     let traffic_log = TrafficLog::new(env::var("TRAFFIC_LOG").ok()).await.unwrap();
 
-    let jba_access_token = authenticate().await;
+    let jba_access_token = authenticate(&*keychain).await;
 
     let mut request = jcp_url.into_client_request().unwrap();
     request.headers_mut().insert(
@@ -100,12 +105,12 @@ async fn run_adapter() {
     {}
 }
 
-async fn authenticate() -> String {
+async fn authenticate(keychain: &dyn SecretBackend) -> String {
     if let Ok(access_key) = env::var("JBA_ACCESS_TOKEN") {
         access_key
     } else {
         // Try to get refresh token from keychain and upgrade it
-        let Some(refresh_token) = get_refresh_token().unwrap() else {
+        let Some(refresh_token) = keychain.get_refresh_token().unwrap() else {
             eprintln!("No refresh token found");
             eprintln!("Please run `acp-jcp login` to authenticate.");
             process::exit(1);
