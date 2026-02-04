@@ -40,7 +40,7 @@ pub async fn login() -> Result<String, AuthError> {
     let http_client = create_http_client()?;
 
     // Start local callback server (blocking, but only binds the socket)
-    let server = Server::http("localhost:0").map_err(|e| AuthError::ServerStart(e.into()))?;
+    let server = Server::http("localhost:0").map_err(AuthError::ServerStart)?;
 
     let local_addr = server
         .server_addr()

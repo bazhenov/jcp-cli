@@ -3,33 +3,6 @@
 version = 4
 
 [[package]]
-name = "acp-jcp"
-version = "0.1.0"
-dependencies = [
- "agent-client-protocol",
- "clap",
- "dotenv",
- "drop-check",
- "futures",
- "futures-util",
- "jwt",
- "oauth2",
- "open",
- "reqwest",
- "security-framework 3.5.1",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tiny_http",
- "tokio",
- "tokio-stream",
- "tokio-test",
- "tokio-tungstenite",
- "tungstenite",
- "url",
-]
-
-[[package]]
 name = "agent-client-protocol"
 version = "0.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -920,6 +893,33 @@ name = "itoa"
 version = "1.0.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92ecc6618181def0457392ccd0ee51198e065e016d1d527a7ac1b6dc7c1f09d2"
+
+[[package]]
+name = "jcp"
+version = "0.1.0"
+dependencies = [
+ "agent-client-protocol",
+ "clap",
+ "dotenv",
+ "drop-check",
+ "futures",
+ "futures-util",
+ "jwt",
+ "oauth2",
+ "open",
+ "reqwest",
+ "security-framework 3.5.1",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tiny_http",
+ "tokio",
+ "tokio-stream",
+ "tokio-test",
+ "tokio-tungstenite",
+ "tungstenite",
+ "url",
+]
 
 [[package]]
 name = "js-sys"

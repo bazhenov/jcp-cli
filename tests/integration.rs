@@ -1,11 +1,11 @@
 mod harness;
 
-use acp_jcp::{Config, NewSessionMeta};
 use agent_client_protocol::{
     AgentResponse, ClientRequest, InitializeRequest, InitializeResponse, NewSessionRequest,
     ProtocolVersion, Response,
 };
 use harness::TestHarness;
+use jcp::{Config, NewSessionMeta};
 
 const TEST_GIT_URL: &str = "https://github.com/test/repo.git";
 const TEST_BRANCH: &str = "main";

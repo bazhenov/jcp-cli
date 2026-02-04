@@ -6,11 +6,11 @@
 //! The harness drives the adapter synchronously via `step()`, eliminating
 //! the need for timeouts and making tests deterministic.
 
-use acp_jcp::{Adapter, Config, Transport};
 use agent_client_protocol::{
     AgentResponse, AgentSide, ClientRequest, ClientSide, JsonRpcMessage, OutgoingMessage, Request,
     RequestId, Response, Side,
 };
+use jcp::{Adapter, Config, Transport};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, value::RawValue};
 use std::io;

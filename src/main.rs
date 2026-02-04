@@ -1,11 +1,11 @@
-use acp_jcp::{
+use clap::{Parser, Subcommand};
+use dotenv::dotenv;
+use futures_util::StreamExt;
+use jcp::{
     Adapter, Config, IoTransport, TrafficLog, WebSocketTransport,
     auth::{get_access_token, login},
     keychain::{delete_refresh_token, get_refresh_token, store_refresh_token},
 };
-use clap::{Parser, Subcommand};
-use dotenv::dotenv;
-use futures_util::StreamExt;
 use std::{env, process};
 use tokio::io::{stdin, stdout};
 use tokio_tungstenite::connect_async;

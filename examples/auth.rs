@@ -1,4 +1,4 @@
-use acp_jcp::{
+use jcp::{
     auth::{get_access_token, login},
     keychain::get_refresh_token,
 };
