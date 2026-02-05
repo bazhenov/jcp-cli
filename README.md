@@ -24,9 +24,9 @@ $ cargo install --path=.
     "args": ["acp"],
     "env": {
       "AI_PLATFORM_TOKEN": "...",
-    },
-  },
-},
+    }
+  }
+}
 ```
 
 # Developing
