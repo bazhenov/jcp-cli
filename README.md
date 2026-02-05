@@ -10,7 +10,7 @@ $ cargo install --path=.
 
 # Configuring
 
-1. create `.env` file with `AI_PLATFORM_TOKEN` defined to OAuth2 Development Token from https://platform.stgn.jetbrains.ai. or use IDE configuration to pass env-variable
+1. create `.env` file in the project directory or any parent of with `AI_PLATFORM_TOKEN` in it defined to OAuth2 Development Token from https://platform.stgn.jetbrains.ai or use IDE configuration to pass env-variable
 2. do `jcp login`
 3. configure your IDE with `jcp acp` as an ACP agent.
 
