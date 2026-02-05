@@ -3,12 +3,11 @@ use oauth2::{
     AuthUrl, AuthorizationCode, ClientId, CsrfToken, PkceCodeChallenge, RedirectUrl, Scope,
     TokenResponse, TokenUrl, basic::BasicClient,
 };
-use reqwest::{Client, redirect::Policy};
+use reqwest::{blocking::Client, redirect::Policy};
 use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
 use tiny_http::{Response, Server};
-use tokio::task::spawn_blocking;
 use url::Url;
 
 /// Base URL for JetBrains OAuth provider
@@ -36,10 +35,10 @@ const CALLBACK_PATH: &str = "/space/auth";
 ///
 /// The refresh token can be stored (e.g., in keychain) and used with
 /// `get_access_token()` to obtain access tokens without re-authentication.
-pub async fn login() -> Result<String, AuthError> {
+pub fn login() -> Result<String, AuthError> {
     let http_client = create_http_client()?;
 
-    // Start local callback server (blocking, but only binds the socket)
+    // Start local callback server
     let server = Server::http("localhost:0").map_err(AuthError::ServerStart)?;
 
     let local_addr = server
@@ -80,17 +79,14 @@ pub async fn login() -> Result<String, AuthError> {
     // Open browser
     open::that(auth_url.to_string()).map_err(AuthError::BrowserOpen)?;
 
-    // Wait for callback (blocking tiny_http in spawn_blocking)
-    let code = spawn_blocking(move || read_authorization_code_from_callback(server, csrf_token))
-        .await
-        .map_err(|e| AuthError::ServerStart(e.into()))??;
+    // Wait for callback
+    let code = read_authorization_code_from_callback(server, csrf_token)?;
 
-    // Exchange code for tokens using oauth2 client (async)
+    // Exchange code for tokens
     let token_response = client
         .exchange_code(code)
         .set_pkce_verifier(pkce_verifier)
-        .request_async(&http_client)
-        .await
+        .request(&http_client)
         .map_err(|e| AuthError::TokenExchange(e.into()))?;
 
     token_response
@@ -107,17 +103,17 @@ pub async fn login() -> Result<String, AuthError> {
 /// 3. Switches the token audience to get a JCP-scoped token
 ///
 /// Use this with a refresh token obtained from [`login()`].
-pub async fn get_access_token(refresh_token: &str) -> Result<String, AuthError> {
+pub fn get_access_token(refresh_token: &str) -> Result<String, AuthError> {
     let http_client = create_http_client()?;
 
     // Refresh to get a new access token
-    let access_token = refresh_access_token(&http_client, refresh_token).await?;
+    let access_token = refresh_access_token(&http_client, refresh_token)?;
 
     // Get organization info
-    let org_info = get_org_info(&http_client, &access_token).await?;
+    let org_info = get_org_info(&http_client, &access_token)?;
 
     // Switch token audience for JCP access
-    switch_token_audience(&http_client, refresh_token, &org_info).await
+    switch_token_audience(&http_client, refresh_token, &org_info)
 }
 
 /// Creates an HTTP client configured for OAuth operations.
@@ -128,10 +124,7 @@ fn create_http_client() -> Result<Client, AuthError> {
 }
 
 /// Refreshes an access token using a refresh token.
-async fn refresh_access_token(
-    http_client: &Client,
-    refresh_token: &str,
-) -> Result<String, AuthError> {
+fn refresh_access_token(http_client: &Client, refresh_token: &str) -> Result<String, AuthError> {
     let token_url = format!("{}/oauth2/token", OAUTH_BASE_URL);
 
     let response = http_client
@@ -141,38 +134,36 @@ async fn refresh_access_token(
             ("refresh_token", refresh_token),
             ("client_id", CLIENT_ID),
         ])
-        .send()
-        .await?;
+        .send()?;
 
     let status = response.status().as_u16();
     if status != 200 {
         return Err(AuthError::TokenRefresh {
             status,
-            body: response.text().await.unwrap_or_default(),
+            body: response.text().unwrap_or_default(),
         });
     }
 
-    Ok(response.json::<OAuthTokenResponse>().await?.access_token)
+    Ok(response.json::<OAuthTokenResponse>()?.access_token)
 }
 
 /// Fetches organization info from JCP using the access token.
-async fn get_org_info(http_client: &Client, access_token: &str) -> Result<OrgInfo, AuthError> {
+fn get_org_info(http_client: &Client, access_token: &str) -> Result<OrgInfo, AuthError> {
     let response = http_client
         .get(format!("{}/org/orgsuserinfo", JCP_API_URL))
         .bearer_auth(access_token)
         .header("Accept", "application/jwt")
-        .send()
-        .await?;
+        .send()?;
 
     let status = response.status().as_u16();
     if status != 200 {
         return Err(AuthError::OrgInfoFetch {
             status,
-            body: response.text().await.unwrap_or_default(),
+            body: response.text().unwrap_or_default(),
         });
     }
 
-    let raw_token = response.text().await?;
+    let raw_token = response.text()?;
 
     // Parse JWT to extract organization ID
     let token: Token<Value, JcpTokenClaims, _> = Token::parse_unverified(&raw_token)?;
@@ -201,7 +192,7 @@ async fn get_org_info(http_client: &Client, access_token: &str) -> Result<OrgInf
 /// Switches the token audience to get a JCP-scoped access token.
 ///
 /// https://youtrack.jetbrains.com/projects/JCP/articles/JCP-A-204/Refresh-Token-Flow#org-access-token
-async fn switch_token_audience(
+fn switch_token_audience(
     http_client: &Client,
     refresh_token: &str,
     org_info: &OrgInfo,
@@ -219,18 +210,17 @@ async fn switch_token_audience(
             ("orgs_user_info", &org_info.raw_token),
             ("workspace_id", &org_info.workspace_id),
         ])
-        .send()
-        .await?;
+        .send()?;
 
     let status = response.status().as_u16();
     if status != 200 {
         return Err(AuthError::AudienceSwitch {
             status,
-            body: response.text().await.unwrap_or_default(),
+            body: response.text().unwrap_or_default(),
         });
     }
 
-    Ok(response.json::<OAuthTokenResponse>().await?.access_token)
+    Ok(response.json::<OAuthTokenResponse>()?.access_token)
 }
 
 /// Waits for the OAuth callback and extracts the authorization code.

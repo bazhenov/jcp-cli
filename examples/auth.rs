@@ -3,13 +3,12 @@ use jcp::{
     keychain,
 };
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let keychain = keychain::platform_keychain();
     let token = if let Some(refresh_token) = keychain.get_refresh_token().unwrap() {
-        get_access_token(&refresh_token).await.unwrap()
+        get_access_token(&refresh_token).unwrap()
     } else {
-        login().await.unwrap()
+        login().unwrap()
     };
     eprintln!("=== Authentication Successful ===\n");
     eprintln!("Access Token:\n  {}\n", token);

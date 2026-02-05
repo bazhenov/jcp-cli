@@ -1,15 +1,11 @@
 use clap::{Parser, Subcommand};
 use dotenv::dotenv;
-use futures_util::StreamExt;
 use jcp::{
-    Adapter, Config, IoTransport, TrafficLog, WebSocketTransport,
     auth::{get_access_token, login},
     keychain::{self, SecretBackend},
 };
 use std::{env, process};
-use tokio::io::{stdin, stdout};
-use tokio_tungstenite::connect_async;
-use tungstenite::client::IntoClientRequest;
+use tokio::runtime::Runtime;
 
 #[derive(Parser)]
 #[command(name = "acp-jcp")]
@@ -31,8 +27,7 @@ enum Commands {
     Acp,
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     dotenv().ok();
 
     let cli = Cli::parse();
@@ -41,7 +36,7 @@ async fn main() {
     match cli.command {
         Commands::Login => {
             eprintln!("Starting authentication...");
-            match login().await {
+            match login() {
                 Ok(refresh_token) => {
                     if let Err(e) = keychain.store_refresh_token(&refresh_token) {
                         eprintln!("Failed to store refresh token in keychain: {}", e);
@@ -59,21 +54,25 @@ async fn main() {
             keychain.delete_refresh_token().unwrap();
             eprintln!("Logout successful!");
         }
-        Commands::Acp => run_adapter().await,
+        Commands::Acp => run_adapter(&*keychain),
     }
 }
 
-async fn run_adapter() {
-    let keychain = keychain::platform_keychain();
+fn run_adapter(keychain: &dyn SecretBackend) {
+    use futures_util::StreamExt;
+    use jcp::{Adapter, Config, IoTransport, TrafficLog, WebSocketTransport};
+    use tokio::io::{stdin, stdout};
+    use tokio_tungstenite::connect_async;
+    use tungstenite::client::IntoClientRequest;
+
     let git_url = env::var("GIT_URL").expect("GIT_URL env variable should be configured");
     let ai_platform_token =
         env::var("AI_PLATFORM_TOKEN").expect("AI_PLATFORM_TOKEN env variable should be configured");
     let jcp_url = env::var("JCP_URL")
         .ok()
         .unwrap_or("wss://api.stgn.jetbrains.cloud/agent-spawner/acp".into());
-    let traffic_log = TrafficLog::new(env::var("TRAFFIC_LOG").ok()).await.unwrap();
 
-    let jba_access_token = authenticate(&*keychain).await;
+    let jba_access_token = authenticate(keychain);
 
     let mut request = jcp_url.into_client_request().unwrap();
     request.headers_mut().insert(
@@ -89,23 +88,28 @@ async fn run_adapter() {
         supports_user_git_auth_flow: false,
     };
 
-    let (ws_stream, _) = connect_async(request).await.unwrap();
-    let (ws_tx, ws_rx) = ws_stream.split();
+    let runtime = Runtime::new().expect("Failed to create Tokio runtime");
+    runtime.block_on(async {
+        let traffic_log = TrafficLog::new(env::var("TRAFFIC_LOG").ok()).await.unwrap();
 
-    let downlink = IoTransport::new(stdin(), stdout());
-    let uplink = WebSocketTransport::new(ws_rx, ws_tx);
+        let (ws_stream, _) = connect_async(request).await.unwrap();
+        let (ws_tx, ws_rx) = ws_stream.split();
 
-    let mut adapter = Adapter::new(config, downlink, uplink);
-    adapter.set_traffic_log(traffic_log);
-    while adapter
-        .handle_next_message()
-        .await
-        .expect("Unable to handle message")
-        .is_some()
-    {}
+        let downlink = IoTransport::new(stdin(), stdout());
+        let uplink = WebSocketTransport::new(ws_rx, ws_tx);
+
+        let mut adapter = Adapter::new(config, downlink, uplink);
+        adapter.set_traffic_log(traffic_log);
+        while adapter
+            .handle_next_message()
+            .await
+            .expect("Unable to handle message")
+            .is_some()
+        {}
+    });
 }
 
-async fn authenticate(keychain: &dyn SecretBackend) -> String {
+fn authenticate(keychain: &dyn SecretBackend) -> String {
     if let Ok(access_key) = env::var("JBA_ACCESS_TOKEN") {
         access_key
     } else {
@@ -115,7 +119,7 @@ async fn authenticate(keychain: &dyn SecretBackend) -> String {
             eprintln!("Please run `acp-jcp login` to authenticate.");
             process::exit(1);
         };
-        match get_access_token(&refresh_token).await {
+        match get_access_token(&refresh_token) {
             Ok(token) => token,
             Err(e) => {
                 eprintln!("Failed to get access token: {}", e);
