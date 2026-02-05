@@ -1,9 +1,9 @@
 //! Test harness for integration testing the ACP-JCP adapter.
 //!
-//! Provides a clean API for testing the adapter without dealing with
+//! Provides an API for testing the adapter without dealing with
 //! websocket setup, channels, and async coordination directly.
 //!
-//! The harness drives the adapter synchronously via `step()`, eliminating
+//! The harness drives the adapter synchronously, eliminating
 //! the need for timeouts and making tests deterministic.
 
 use agent_client_protocol::{
@@ -20,9 +20,6 @@ use tokio::sync::mpsc;
 ///
 /// Provides an API for sending messages from the client side,
 /// receiving them on the server side, and vice versa.
-///
-/// The adapter is driven synchronously via `step()`, making tests
-/// deterministic without timeouts.
 pub struct TestHarness {
     /// The adapter instance
     adapter: Adapter<ChannelTransport, ChannelTransport>,
@@ -50,17 +47,17 @@ impl TestHarness {
         }
     }
 
-    /// Process the next message in the adapter.
+    /// Process the all enqueued messages in the adapter.
     ///
-    /// Returns `Some(())` if a message was processed, `None` if channels are closed.
-    pub async fn step(&mut self) -> io::Result<Option<()>> {
-        self.adapter.handle_next_message().await
+    /// After this method was called it is safe to assume that all requests were sent to their
+    /// conterparties
+    async fn deliver_transport_messages(&mut self) -> io::Result<()> {
+        self.adapter.handle_enqueued_messages().await
     }
 
     /// Send a request from the client to the adapter.
     ///
     /// This simulates a client (IDE) sending a JSON-RPC request via stdin.
-    /// Note: Call `step()` after this to process the message.
     pub async fn client_send(&mut self, request: ClientRequest) -> RequestId {
         let id = RequestId::Number(self.next_request_id as i64);
         self.next_request_id += 1;
@@ -75,23 +72,25 @@ impl TestHarness {
         let value = serde_json::to_value(&msg).unwrap();
         let _ = self.client.send(value).await;
 
+        self.deliver_transport_messages().await.unwrap();
+
         id
     }
 
     /// Send a raw JSON-RPC message from the client.
     ///
     /// Useful for testing edge cases or notifications.
-    /// Note: Call `step()` after this to process the message.
     #[allow(dead_code)]
     pub async fn client_send_raw(&mut self, json: &str) {
         let value: Value = serde_json::from_str(json).unwrap();
         let _ = self.client.send(value).await;
+
+        self.deliver_transport_messages().await.unwrap();
     }
 
     /// Receive a request that the adapter forwarded to the server.
     ///
     /// Returns the raw JSON value for flexible assertions.
-    /// Note: Call `step()` before this to ensure the message has been processed.
     pub fn server_recv(&mut self) -> Value {
         self.server
             .try_recv()
@@ -99,8 +98,6 @@ impl TestHarness {
     }
 
     /// Receive a request that the adapter forwarded to the server, parsed as ClientRequest.
-    ///
-    /// Note: Call `step()` before this to ensure the message has been processed.
     pub fn server_recv_request(&mut self) -> (RequestId, ClientRequest) {
         let value = self.server_recv();
 
@@ -125,8 +122,6 @@ impl TestHarness {
     }
 
     /// Send a response from the server back to the adapter.
-    ///
-    /// Note: Call `step()` after this to process the response.
     pub async fn server_reply(&mut self, id: RequestId, response: AgentResponse) {
         let msg = JsonRpcMessage::wrap(OutgoingMessage::Response::<AgentSide, ClientSide>(
             Response::new(id, Ok::<_, agent_client_protocol::Error>(response)),
@@ -134,21 +129,22 @@ impl TestHarness {
 
         let value = serde_json::to_value(&msg).unwrap();
         let _ = self.server.send(value).await;
+
+        self.deliver_transport_messages().await.unwrap();
     }
 
     /// Send a raw JSON response from the server.
-    ///
-    /// Note: Call `step()` after this to process the response.
     #[allow(dead_code)]
     pub async fn server_reply_raw(&mut self, json: &str) {
         let value: Value = serde_json::from_str(json).unwrap();
         let _ = self.server.send(value).await;
+
+        self.deliver_transport_messages().await.unwrap();
     }
 
     /// Receive a response that the adapter forwarded to the client.
     ///
     /// Returns the parsed response for assertions.
-    /// Note: Call `step()` before this to ensure the response has been processed.
     pub fn client_recv<T: DeserializeOwned>(&mut self) -> Response<T> {
         let value = self
             .client
@@ -159,9 +155,6 @@ impl TestHarness {
     }
 }
 
-/// Transport implementation using tokio mpsc channels.
-///
-/// Useful for testing where you need to control both ends of the transport.
 pub struct ChannelTransport {
     rx: mpsc::Receiver<Value>,
     tx: mpsc::Sender<Value>,

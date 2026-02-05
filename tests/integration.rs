@@ -30,9 +30,6 @@ async fn test_adapter_forwards_initialize_request_to_server() {
     let request = ClientRequest::InitializeRequest(InitializeRequest::new(1.into()));
     let request_id = harness.client_send(request).await;
 
-    // Process the client message
-    harness.step().await.unwrap();
-
     // Server receives the forwarded request (no timeout needed)
     let (recv_id, recv_request) = harness.server_recv_request();
     assert_eq!(recv_id, request_id);
@@ -42,9 +39,6 @@ async fn test_adapter_forwards_initialize_request_to_server() {
     // Server sends response
     let response = AgentResponse::InitializeResponse(initialize_response.clone());
     harness.server_reply(recv_id, response).await;
-
-    // Process the server response
-    harness.step().await.unwrap();
 
     // Client receives the response (no timeout needed)
     let result = harness.client_recv::<InitializeResponse>();
@@ -68,9 +62,6 @@ async fn test_adapter_injects_meta_into_new_session_request() {
             "/test",
         )))
         .await;
-
-    // Process the client message
-    harness.step().await.unwrap();
 
     // Server receives the request with injected meta (no timeout needed)
     let (_, received) = harness.server_recv_request();

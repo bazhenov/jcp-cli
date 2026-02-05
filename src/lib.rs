@@ -2,7 +2,7 @@ use agent_client_protocol::{
     self as acp, AgentSide, ClientRequest, ClientSide, JsonRpcMessage, NewSessionRequest,
     OutgoingMessage, RawValue, Request, Side,
 };
-use futures::{Sink, Stream};
+use futures::{FutureExt, Sink, Stream};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -262,6 +262,24 @@ where
             else => return Ok(None),
         }
         Ok(Some(()))
+    }
+
+    /// Handles all enqueued messages in the transport
+    ///
+    /// Should be used for tests only, because using this method in a loop will cause CPU spin.
+    /// Use [`Self::handle_next_message()`] instead
+    pub async fn handle_enqueued_messages(&mut self) -> io::Result<()> {
+        while let Some(msg) = self.downlink.recv().now_or_never() {
+            if let Some(msg) = msg? {
+                self.handle_client_message(msg).await?;
+            }
+        }
+        while let Some(msg) = self.uplink.recv().now_or_never() {
+            if let Some(msg) = msg? {
+                self.downlink.send(msg).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Handle a message from the client (uplink: client -> server)
