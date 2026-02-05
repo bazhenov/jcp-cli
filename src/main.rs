@@ -4,8 +4,40 @@ use jcp::{
     auth::{get_access_token, login},
     keychain::{self, SecretBackend},
 };
+use std::process::Command;
 use std::{env, process};
 use tokio::runtime::Runtime;
+
+struct GitInfo {
+    url: String,
+    branch: String,
+    revision: String,
+}
+
+fn run_git(args: &[&str]) -> Result<String, String> {
+    let output = Command::new("git")
+        .args(args)
+        .output()
+        .map_err(|e| format!("Failed to execute git: {}", e))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Retrieves git repository information from the current directory.
+/// Returns URL of the remote origin, current branch name, and HEAD commit SHA.
+fn get_git_info() -> Result<GitInfo, String> {
+    let url = run_git(&["remote", "get-url", "origin"])?;
+    let branch = run_git(&["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let revision = run_git(&["rev-parse", "HEAD"])?;
+
+    Ok(GitInfo {
+        url,
+        branch,
+        revision,
+    })
+}
 
 #[derive(Parser)]
 #[command(name = "acp-jcp")]
@@ -65,9 +97,15 @@ fn run_adapter(keychain: &dyn SecretBackend) {
     use tokio_tungstenite::connect_async;
     use tungstenite::client::IntoClientRequest;
 
-    let git_url = env::var("GIT_URL").expect("GIT_URL env variable should be configured");
-    let ai_platform_token =
-        env::var("AI_PLATFORM_TOKEN").expect("AI_PLATFORM_TOKEN env variable should be configured");
+    let git_info = get_git_info().unwrap_or_else(|e| {
+        eprintln!("Failed to get git info: {}", e);
+        process::exit(1);
+    });
+
+    let Some(ai_platform_token) = env::var("AI_PLATFORM_TOKEN").ok() else {
+        eprintln!("AI_PLATFORM_TOKEN env variable should be configured");
+        process::exit(1);
+    };
     let jcp_url = env::var("JCP_URL")
         .ok()
         .unwrap_or("wss://api.stgn.jetbrains.cloud/agent-spawner/acp".into());
@@ -81,9 +119,9 @@ fn run_adapter(keychain: &dyn SecretBackend) {
     );
 
     let config = Config {
-        git_url,
-        branch: "main".into(),
-        revision: "main".into(),
+        git_url: git_info.url,
+        branch: git_info.branch,
+        revision: git_info.revision,
         ai_platform_token,
         supports_user_git_auth_flow: false,
     };

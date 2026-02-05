@@ -38,11 +38,18 @@ pub trait SecretBackend {
 
 #[cfg(target_os = "macos")]
 pub fn platform_keychain() -> Box<dyn SecretBackend> {
+    // This conditional compilation is little bit cryptic, but it does
+    // make sure that whatever profile we building (release/debug) we don't
+    // get dead code warning, without any explicit `#[allow(dead_code)]`
+    #[cfg(debug_assertions)]
     if cfg!(debug_assertions) {
         Box::new(file::FileBackend::new())
     } else {
         Box::new(macos::MacOsBackend)
     }
+
+    #[cfg(not(debug_assertions))]
+    Box::new(macos::MacOsBackend)
 }
 
 #[cfg(target_os = "macos")]
