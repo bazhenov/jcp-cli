@@ -10,6 +10,7 @@ use agent_client_protocol::{
     AgentResponse, AgentSide, ClientRequest, ClientSide, JsonRpcMessage, OutgoingMessage, Request,
     RequestId, Response, Side,
 };
+use futures::FutureExt;
 use jcp::{Adapter, Config, Transport};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, value::RawValue};
@@ -29,6 +30,15 @@ pub struct TestHarness {
     server: ChannelTransport,
     /// Next request ID for client requests
     next_request_id: u32,
+}
+
+/// Making sure future completes immedateley on a first poll.
+/// It is appropriate in the test context, becase we use local mpsc-channels
+macro_rules! now_or_panic {
+    ($e:expr) => {
+        $e.now_or_never()
+            .expect("Future should be completed immediatley")
+    };
 }
 
 impl TestHarness {
@@ -51,14 +61,14 @@ impl TestHarness {
     ///
     /// After this method was called it is safe to assume that all requests were sent to their
     /// conterparties
-    async fn deliver_transport_messages(&mut self) -> io::Result<()> {
-        self.adapter.handle_enqueued_messages().await
+    fn deliver_transport_messages(&mut self) -> io::Result<()> {
+        now_or_panic!(self.adapter.handle_enqueued_messages())
     }
 
     /// Send a request from the client to the adapter.
     ///
     /// This simulates a client (IDE) sending a JSON-RPC request via stdin.
-    pub async fn client_send(&mut self, request: ClientRequest) -> RequestId {
+    pub fn client_send(&mut self, request: ClientRequest) -> RequestId {
         let id = RequestId::Number(self.next_request_id as i64);
         self.next_request_id += 1;
 
@@ -70,9 +80,9 @@ impl TestHarness {
             }));
 
         let value = serde_json::to_value(&msg).unwrap();
-        let _ = self.client.send(value).await;
+        let _ = now_or_panic!(self.client.send(value));
 
-        self.deliver_transport_messages().await.unwrap();
+        self.deliver_transport_messages().unwrap();
 
         id
     }
@@ -81,11 +91,11 @@ impl TestHarness {
     ///
     /// Useful for testing edge cases or notifications.
     #[allow(dead_code)]
-    pub async fn client_send_raw(&mut self, json: &str) {
+    pub fn client_send_raw(&mut self, json: &str) {
         let value: Value = serde_json::from_str(json).unwrap();
-        let _ = self.client.send(value).await;
+        let _ = now_or_panic!(self.client.send(value));
 
-        self.deliver_transport_messages().await.unwrap();
+        self.deliver_transport_messages().unwrap();
     }
 
     /// Receive a request that the adapter forwarded to the server.
@@ -122,24 +132,24 @@ impl TestHarness {
     }
 
     /// Send a response from the server back to the adapter.
-    pub async fn server_reply(&mut self, id: RequestId, response: AgentResponse) {
+    pub fn server_reply(&mut self, id: RequestId, response: AgentResponse) {
         let msg = JsonRpcMessage::wrap(OutgoingMessage::Response::<AgentSide, ClientSide>(
             Response::new(id, Ok::<_, agent_client_protocol::Error>(response)),
         ));
 
         let value = serde_json::to_value(&msg).unwrap();
-        let _ = self.server.send(value).await;
+        let _ = now_or_panic!(self.server.send(value));
 
-        self.deliver_transport_messages().await.unwrap();
+        self.deliver_transport_messages().unwrap();
     }
 
     /// Send a raw JSON response from the server.
     #[allow(dead_code)]
-    pub async fn server_reply_raw(&mut self, json: &str) {
+    pub fn server_reply_raw(&mut self, json: &str) {
         let value: Value = serde_json::from_str(json).unwrap();
-        let _ = self.server.send(value).await;
+        let _ = now_or_panic!(self.server.send(value));
 
-        self.deliver_transport_messages().await.unwrap();
+        self.deliver_transport_messages().unwrap();
     }
 
     /// Receive a response that the adapter forwarded to the client.
