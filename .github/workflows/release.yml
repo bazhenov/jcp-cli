@@ -62,7 +62,7 @@ jobs:
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
+          targets: aarch64-apple-darwin
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -81,6 +81,7 @@ jobs:
         id: package
         run: |
           VERSION="${{ steps.version.outputs.version }}"
+          TARGET="aarch64-apple-darwin"
 
           ARCHIVE_NAME="${BINARY_NAME}-${VERSION}-${TARGET}.tar.gz"
           tar -czf "${ARCHIVE_NAME}" -C dist .
