@@ -33,11 +33,11 @@ pub struct TestHarness {
 }
 
 /// Making sure future completes immedateley on a first poll.
-/// It is appropriate in the test context, becase we use local mpsc-channels
+/// It is appropriate in the test context, because we use local mpsc-channels
 macro_rules! now_or_panic {
     ($e:expr) => {
         $e.now_or_never()
-            .expect("Future should be completed immediatley")
+            .expect("Future should be completed immediately")
     };
 }
 
