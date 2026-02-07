@@ -3,6 +3,14 @@ name = "jcp"
 version = "0.1.0"
 edition = "2024"
 repository = "https://github.com/jetbrains/jcp-cli"
+homepage = "https://github.com/jetbrains/jcp-cli"
+description = "JetBrains Cloud Platform CLI"
+
+[package.metadata.wix]
+upgrade-guid = "25216205-50F1-45BF-A3A9-0EA2B86E51C8"
+path-guid = "11FD36E7-42D4-4360-9EC3-DBF35408FBC7"
+license = false
+eula = false
 
 [dependencies]
 agent-client-protocol = "0.9.3"
@@ -33,3 +41,8 @@ drop-check = { git = "https://github.com/bazhenov/drop-check" }
 tokio-test = "0.4"
 tokio-stream = "0.1"
 tempfile = "3"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
