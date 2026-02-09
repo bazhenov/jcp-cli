@@ -1,9 +1,9 @@
 [package]
 name = "jcp"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
-repository = "https://github.com/jetbrains/jcp-cli"
-homepage = "https://github.com/jetbrains/jcp-cli"
+repository = "https://github.com/bazhenov/jcp-cli"
+homepage = "https://github.com/bazhenov/jcp-cli"
 description = "JetBrains Cloud Platform CLI"
 
 [package.metadata.wix]
