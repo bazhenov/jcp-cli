@@ -5,7 +5,8 @@
 /// so tests can read it and configure the client accordingly.
 use agent_client_protocol::{
     AgentResponse, AgentSide, ClientRequest, ClientSide, InitializeResponse, JsonRpcMessage,
-    OutgoingMessage, PromptResponse, RawValue, RequestId, Response, Side, StopReason,
+    NewSessionResponse, OutgoingMessage, PromptResponse, RawValue, RequestId, Response, Side,
+    StopReason,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -54,6 +55,9 @@ async fn main() {
         let response = match request {
             ClientRequest::InitializeRequest(req) => {
                 AgentResponse::InitializeResponse(InitializeResponse::new(req.protocol_version))
+            }
+            ClientRequest::NewSessionRequest(_) => {
+                AgentResponse::NewSessionResponse(NewSessionResponse::new("1"))
             }
             ClientRequest::PromptRequest(_) => {
                 AgentResponse::PromptResponse(PromptResponse::new(StopReason::EndTurn))

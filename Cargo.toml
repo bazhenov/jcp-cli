@@ -42,7 +42,6 @@ drop-check = { git = "https://github.com/bazhenov/drop-check" }
 tokio-test = "0.4"
 tokio-stream = "0.1"
 tempfile = "3"
-rexpect = "0.6.3"
 
 # The profile that 'dist' will build with
 [profile.dist]
