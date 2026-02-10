@@ -5,6 +5,7 @@ edition = "2024"
 repository = "https://github.com/bazhenov/jcp-cli"
 homepage = "https://github.com/bazhenov/jcp-cli"
 description = "JetBrains Cloud Platform CLI"
+default-run = "jcp"
 
 [package.metadata.wix]
 upgrade-guid = "25216205-50F1-45BF-A3A9-0EA2B86E51C8"
