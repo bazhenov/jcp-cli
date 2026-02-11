@@ -202,7 +202,7 @@ fn serve_acp_client(listener: TcpListener) {
     }
 
     // We intentionally panic here, because in the test environment it's much more convenient
-    // to have an error immediatley on stderr. It's not reliable to communicate errors via Result.
+    // to have an error immediately on stderr. It's not reliable to communicate errors via Result.
     // The test might be stuck somewhere else preventing it for joining on server thread Result.
     let (tcp_stream, _) = listener.accept().expect("Failed on accept()");
     let mut ws = tungstenite::accept(tcp_stream).expect("Failed on websocket handshake");
