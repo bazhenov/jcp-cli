@@ -1,20 +1,23 @@
 use agent_client_protocol::{
-    AgentResponse, AgentSide, ClientRequest, ClientSide, ContentBlock, InitializeRequest,
-    InitializeResponse, JsonRpcMessage, NewSessionRequest, NewSessionResponse, OutgoingMessage,
-    PromptRequest, PromptResponse, ProtocolVersion, RawValue, Request, RequestId, Response, Side,
-    StopReason, TextContent,
+    AgentNotification, AgentResponse, AgentSide, ClientRequest, ClientSide, ContentBlock,
+    ContentChunk, InitializeRequest, InitializeResponse, JsonRpcMessage, NewSessionRequest,
+    NewSessionResponse, Notification, OutgoingMessage, PromptRequest, PromptResponse,
+    ProtocolVersion, RawValue, Request, RequestId, Response, SessionNotification, SessionUpdate,
+    Side, StopReason, TextContent,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde_json::Value;
+use std::io::Read;
 use std::{
-    io::{BufRead, BufReader, Write},
+    io::{self, BufRead, BufReader, Write},
     net::TcpListener,
     path::PathBuf,
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     str::FromStr,
     thread::{self, JoinHandle},
 };
-use tungstenite::{Message, Utf8Bytes};
+use tungstenite::{Message, Utf8Bytes, WebSocket};
 use url::Url;
 
 #[test]
@@ -33,43 +36,60 @@ fn prompt_turn() {
     let mut e2e = E2eHarness::bootstrap();
 
     // Step 1: Initialize handshake
-    let response: InitializeResponse = e2e.client_send(ClientRequest::InitializeRequest(
+    let (response, _) = e2e.client_send::<InitializeResponse>(ClientRequest::InitializeRequest(
         InitializeRequest::new(ProtocolVersion::V1),
     ));
     assert_eq!(response.protocol_version, ProtocolVersion::V1);
 
     // Step 2: Creating a new session
-    let response: NewSessionResponse = e2e.client_send(ClientRequest::NewSessionRequest(
+    let (response, _) = e2e.client_send::<NewSessionResponse>(ClientRequest::NewSessionRequest(
         NewSessionRequest::new("./"),
     ));
     assert!(!response.session_id.0.is_empty());
 
-    // Step 3: prompt turn
-    let prompt = PromptRequest::new(
-        response.session_id,
-        vec![ContentBlock::Text(TextContent::new("Prompt"))],
-    );
-    let response: PromptResponse = e2e.client_send(ClientRequest::PromptRequest(prompt));
-    assert_eq!(response.stop_reason, StopReason::EndTurn);
+    let prompt = ContentBlock::Text(TextContent::new("Prompt"));
 
-    e2e.shutdown();
+    // Step 3: prompt turn
+    let prompt_request = PromptRequest::new(response.session_id, vec![prompt.clone()]);
+    let (response, mut notifications) =
+        e2e.client_send::<PromptResponse>(ClientRequest::PromptRequest(prompt_request));
+    assert_eq!(response.stop_reason, StopReason::EndTurn);
+    assert_eq!(
+        notifications.len(),
+        1,
+        "Server should echo back with original prompt"
+    );
+    match notifications.pop().unwrap() {
+        AgentNotification::SessionNotification(n) => match n.update {
+            SessionUpdate::AgentMessageChunk(u) => assert_eq!(u.content, prompt),
+            u => panic!("Unexpected update: {u:?}"),
+        },
+        n => panic!("Unexpected notification: {n:?}"),
+    };
 }
 
 /// E2E test harness that manages mock server and jcp processes.
 ///
-/// Starts an in-process mock ACP server on a background tokio task
+/// Starts an in-process mock ACP server on a background task
 /// and spawns `jcp acp`, providing a typed API for sending client
 /// requests and receiving responses.
+///
+/// Needs to be shutted down using [`Self::shutdown()`].
 struct E2eHarness {
     jcp: ChildProcess,
     next_request_id: i64,
-    mock_server_handle: Option<JoinHandle<Result<(), tungstenite::Error>>>,
+    server_handle: Option<JoinHandle<()>>,
 }
 
 impl E2eHarness {
     /// Start the mock server and jcp process, ready for testing.
     fn bootstrap() -> Self {
-        let (url, server_handle) = start_mock_server();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Unable to bind socket");
+
+        let addr = listener.local_addr().unwrap();
+        let url = Url::from_str(&format!("ws://{addr}")).unwrap();
+
+        let server_handle = thread::spawn(move || serve_acp_client(listener));
 
         let jcp = ChildProcess::spawn(
             get_jcp_binary_path(),
@@ -84,7 +104,7 @@ impl E2eHarness {
         Self {
             jcp,
             next_request_id: 1,
-            mock_server_handle: Some(server_handle),
+            server_handle: Some(server_handle),
         }
     }
 
@@ -92,7 +112,10 @@ impl E2eHarness {
     ///
     /// Serializes the request as a JSON-RPC message, sends it via stdin,
     /// reads the response line from stdout, and deserializes the `result` field.
-    fn client_send<T: DeserializeOwned>(&mut self, request: ClientRequest) -> T {
+    fn client_send<T: DeserializeOwned>(
+        &mut self,
+        request: ClientRequest,
+    ) -> (T, Vec<AgentNotification>) {
         let id = self.next_request_id;
         self.next_request_id += 1;
 
@@ -106,35 +129,37 @@ impl E2eHarness {
         let json = serde_json::to_string(&msg).expect("Failed to serialize request");
         self.jcp.send_line(&json);
 
-        let response_line = self.jcp.read_line();
-        let response: serde_json::Value =
-            serde_json::from_str(&response_line).expect("Failed to parse response JSON");
+        let mut notifications: Vec<AgentNotification> = vec![];
 
-        let request_id: i64 =
-            serde_json::from_value(response["id"].clone()).expect("Unable to read id");
-        assert_eq!(
-            request_id, id,
-            "Incoming response is expected to have id {id}, got {request_id} instead"
-        );
-        serde_json::from_value(response["result"].clone())
-            .expect("Failed to deserialize response result")
-    }
+        let msg = loop {
+            let line = self.jcp.read_line();
+            let mut rpc_message: Value =
+                serde_json::from_str(&line).expect("Failed to parse response JSON");
 
-    fn shutdown(mut self) {
-        if let Some(server_join_handle) = self.mock_server_handle.take() {
-            self.jcp.child.kill().ok();
-            self.jcp.child.wait().ok();
-            server_join_handle.join().ok();
-        }
+            if !matches!(rpc_message["id"], Value::Null) {
+                let request_id: i64 =
+                    serde_json::from_value(rpc_message["id"].take()).expect("Unable to read id");
+                assert_eq!(
+                    request_id, id,
+                    "Incoming response is expected to have id {id}, got {request_id} instead"
+                );
+                break serde_json::from_value(rpc_message["result"].take())
+                    .expect("Failed to deserialize response result");
+            } else {
+                let raw: RawIncomingMessage<'_> = serde_json::from_str(&line).unwrap();
+                let method = raw.method.expect("No method given in JSON RPC");
+                notifications
+                    .push(ClientSide::decode_notification(method, raw.params).expect("Unable"));
+            }
+        };
+        (msg, notifications)
     }
 }
 
-/// It's preferential to use [`Self::shutdown()`]
 impl Drop for E2eHarness {
     fn drop(&mut self) {
-        if let Some(server_join_handle) = self.mock_server_handle.take() {
-            self.jcp.child.kill().ok();
-            self.jcp.child.wait().ok();
+        if let Some(server_join_handle) = self.server_handle.take() {
+            self.jcp.kill();
             server_join_handle.join().ok();
         }
     }
@@ -152,56 +177,79 @@ struct RawIncomingMessage<'a> {
     params: Option<&'a RawValue>,
 }
 
-/// Start a mock ACP server on a random port.
-fn start_mock_server() -> (Url, JoinHandle<Result<(), tungstenite::Error>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind mock server");
-    let addr = listener.local_addr().unwrap();
-    let url = Url::from_str(&format!("ws://{addr}")).unwrap();
+/// Serves a mock WS/ACP server.
+///
+/// Server conforms to following rules:
+///
+/// 1. supports basic flow (Initialize->New Session->Text Prompt)
+/// 2. on all prompts server reply with the same content
+/// 3. server is single user. After first user disconnects server exits
+fn serve_acp_client(listener: TcpListener) {
+    type AgentOutgoingMessage = OutgoingMessage<AgentSide, ClientSide>;
 
-    let join_handle = thread::spawn(move || {
-        let (tcp_stream, _) = listener.accept().unwrap();
-        let mut ws = tungstenite::accept(tcp_stream).unwrap();
+    fn send_jrpc<S: Read + Write>(ws: &mut WebSocket<S>, msg: AgentOutgoingMessage) {
+        let json = serde_json::to_string(&JsonRpcMessage::wrap(msg)).expect("Failed serializing");
+        // We don't really care about sending errors.
+        // Most likely it happens because a client disconnected early
+        let _ = ws.send(Message::Text(Utf8Bytes::from(json)));
+    }
 
-        loop {
-            let msg = match ws.read() {
-                Ok(msg) => msg,
-                Err(tungstenite::Error::ConnectionClosed) => return Ok(()),
-                Err(e) => return Err(e),
-            };
+    // We intentionally panic here, because in the test environment it's much more convenient
+    // to have an error immediatley on stderr. It's not reliable to communicate errors via Result.
+    // The test might be stuck somewhere else preventing it for joining on server thread Result.
+    let (tcp_stream, _) = listener.accept().expect("Failed on accept()");
+    let mut ws = tungstenite::accept(tcp_stream).expect("Failed on websocket handshake");
+    let session_id = "SHINY-SESSION-ID";
 
-            let Message::Text(text) = msg else {
-                continue;
-            };
+    loop {
+        let msg = match ws.read() {
+            Ok(msg) => msg,
+            // we have a separate server for each test, so stopping after serving first client,
+            Err(tungstenite::Error::ConnectionClosed) => return,
+            Err(e) => panic!("{e}"),
+        };
 
-            let raw: RawIncomingMessage<'_> = serde_json::from_str(&text).unwrap();
-            let Some((method, id)) = raw.method.zip(raw.id) else {
-                continue;
-            };
+        let Message::Text(text) = msg else {
+            continue;
+        };
 
-            let request = AgentSide::decode_request(method, raw.params).unwrap();
-            let response = match request {
-                ClientRequest::InitializeRequest(req) => {
-                    AgentResponse::InitializeResponse(InitializeResponse::new(req.protocol_version))
+        let raw: RawIncomingMessage<'_> = serde_json::from_str(&text).unwrap();
+        let Some((method, id)) = raw.method.zip(raw.id) else {
+            continue;
+        };
+
+        let request = AgentSide::decode_request(method, raw.params).unwrap();
+        let response = match request {
+            ClientRequest::InitializeRequest(req) => {
+                AgentResponse::InitializeResponse(InitializeResponse::new(req.protocol_version))
+            }
+            ClientRequest::NewSessionRequest(_) => {
+                AgentResponse::NewSessionResponse(NewSessionResponse::new(session_id))
+            }
+            ClientRequest::PromptRequest(r) => {
+                if let Some(block) = r.prompt.first() {
+                    let update = SessionUpdate::AgentMessageChunk(ContentChunk::new(block.clone()));
+                    let notification = AgentNotification::SessionNotification(
+                        SessionNotification::new(session_id, update),
+                    );
+                    send_jrpc(
+                        &mut ws,
+                        AgentOutgoingMessage::Notification(Notification {
+                            method: notification.method().into(),
+                            params: Some(notification),
+                        }),
+                    );
                 }
-                ClientRequest::NewSessionRequest(_) => {
-                    AgentResponse::NewSessionResponse(NewSessionResponse::new("1"))
-                }
-                ClientRequest::PromptRequest(_) => {
-                    AgentResponse::PromptResponse(PromptResponse::new(StopReason::EndTurn))
-                }
-                _ => continue,
-            };
+                AgentResponse::PromptResponse(PromptResponse::new(StopReason::EndTurn))
+            }
+            _ => continue,
+        };
 
-            let msg = JsonRpcMessage::wrap(OutgoingMessage::Response::<AgentSide, ClientSide>(
-                Response::new(id, Ok::<_, agent_client_protocol::Error>(response)),
-            ));
-
-            let json = serde_json::to_string(&msg).unwrap();
-            ws.send(Message::Text(Utf8Bytes::from(json))).unwrap();
-        }
-    });
-
-    (url, join_handle)
+        send_jrpc(
+            &mut ws,
+            AgentOutgoingMessage::Response(Response::new(id, Ok(response))),
+        );
+    }
 }
 
 /// A simple wrapper around a child process with piped stdin/stdout.
@@ -243,12 +291,16 @@ impl ChildProcess {
             .expect("Failed to read from child stdout");
         line
     }
+
+    fn kill(&mut self) {
+        self.child.kill().ok();
+        self.child.wait().ok();
+    }
 }
 
 impl Drop for ChildProcess {
     fn drop(&mut self) {
-        self.child.kill().ok();
-        self.child.wait().ok();
+        self.kill();
     }
 }
 
