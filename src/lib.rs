@@ -1,6 +1,6 @@
 use agent_client_protocol::{
     self as acp, AgentSide, ClientRequest, ClientSide, JsonRpcMessage, NewSessionRequest,
-    OutgoingMessage, RawValue, Request, Side,
+    OutgoingMessage, RawValue, Request, Response, Side,
 };
 use futures::{FutureExt, Sink, Stream};
 use futures_util::{SinkExt, StreamExt};
@@ -18,6 +18,11 @@ use tungstenite::{
 
 pub mod auth;
 pub mod keychain;
+
+pub type AgentOutgoingMessage = OutgoingMessage<AgentSide, ClientSide>;
+pub type ClientOutgoingMessage = OutgoingMessage<ClientSide, AgentSide>;
+
+pub const JSON_RPC_ERROR_INVALID_PARAMS: i32 = -32602;
 
 /// A bidirectional transport for JSON-RPC messages.
 ///
@@ -212,7 +217,8 @@ pub struct RawIncomingMessage<'a> {
 /// This struct processes messages from both channels using `tokio::select!`,
 /// allowing for synchronous test-driving without spawning separate tasks.
 pub struct Adapter<Downlink, Uplink> {
-    new_session_meta: NewSessionMeta,
+    /// Can be missing, in which case adapter should report arror on initialize handlshake
+    config: Result<Config, String>,
     downlink: Downlink,
     uplink: Uplink,
     traffic_log: TrafficLog,
@@ -227,9 +233,9 @@ where
     ///
     /// - `downlink`: transport to the client (IDE)
     /// - `uplink`: transport to the server (JCP)
-    pub fn new(config: Config, downlink: Downlink, uplink: Uplink) -> Self {
+    pub fn new(config: Result<Config, String>, downlink: Downlink, uplink: Uplink) -> Self {
         Self {
-            new_session_meta: config.new_session_meta(),
+            config,
             downlink,
             uplink,
             traffic_log: TrafficLog::default(),
@@ -294,16 +300,34 @@ where
             let mut request = AgentSide::decode_request(method, rpc_msg.params)
                 .map_err(to_io_invalid_data_err)?;
 
-            if let ClientRequest::NewSessionRequest(r) = &mut request {
-                inject_new_session_meta(r, &self.new_session_meta)?;
+            if let ClientRequest::InitializeRequest(_) = request {
+                if let Err(e) = &self.config {
+                    // no git config. Terminating protocol early
+                    let msg =
+                        JsonRpcMessage::wrap(AgentOutgoingMessage::Response(Response::Error {
+                            id: id.clone(),
+                            error: acp::Error::new(JSON_RPC_ERROR_INVALID_PARAMS, e),
+                        }));
+                    let value = serde_json::to_value(&msg).map_err(to_io_invalid_data_err)?;
+                    self.downlink.send(value).await?;
+
+                    return Err(io::Error::other(e.clone()));
+                }
+            } else if let ClientRequest::NewSessionRequest(r) = &mut request {
+                // Assuming config present, because we checking it on a init phase
+                let meta = self
+                    .config
+                    .as_ref()
+                    .expect("No config found")
+                    .new_session_meta();
+                inject_new_session_meta(r, &meta)?;
             }
 
-            let msg =
-                JsonRpcMessage::wrap(OutgoingMessage::Request::<ClientSide, AgentSide>(Request {
-                    id,
-                    method: method.into(),
-                    params: Some(request),
-                }));
+            let msg = JsonRpcMessage::wrap(ClientOutgoingMessage::Request(Request {
+                id,
+                method: method.into(),
+                params: Some(request),
+            }));
 
             let value = serde_json::to_value(&msg).map_err(to_io_invalid_data_err)?;
             self.uplink.send(value).await?;

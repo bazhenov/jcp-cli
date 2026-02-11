@@ -97,11 +97,6 @@ fn run_adapter(keychain: &dyn SecretBackend) {
     use tokio_tungstenite::connect_async;
     use tungstenite::client::IntoClientRequest;
 
-    let git_info = get_git_info().unwrap_or_else(|e| {
-        eprintln!("Failed to get git info: {}", e);
-        process::exit(1);
-    });
-
     let Some(ai_platform_token) = env::var("AI_PLATFORM_TOKEN").ok() else {
         eprintln!("AI_PLATFORM_TOKEN env variable should be configured");
         process::exit(1);
@@ -118,12 +113,20 @@ fn run_adapter(keychain: &dyn SecretBackend) {
         format!("Bearer {jba_access_token}").parse().unwrap(),
     );
 
-    let config = Config {
-        git_url: git_info.url,
-        branch: git_info.branch,
-        revision: git_info.revision,
-        ai_platform_token,
-        supports_user_git_auth_flow: false,
+    let config = match get_git_info() {
+        Ok(git_info) => Ok(Config {
+            git_url: git_info.url,
+            branch: git_info.branch,
+            revision: git_info.revision,
+            ai_platform_token,
+            supports_user_git_auth_flow: false,
+        }),
+        Err(e) => {
+            let desc =
+                format!("Failed to get git info. Program should be run in git working copy. {e}");
+            eprintln!("{desc}");
+            Err(desc)
+        }
     };
 
     let runtime = Runtime::new().expect("Failed to create Tokio runtime");

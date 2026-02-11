@@ -7,11 +7,10 @@
 //! the need for timeouts and making tests deterministic.
 
 use agent_client_protocol::{
-    AgentResponse, AgentSide, ClientRequest, ClientSide, JsonRpcMessage, OutgoingMessage, Request,
-    RequestId, Response, Side,
+    AgentResponse, AgentSide, ClientRequest, JsonRpcMessage, Request, RequestId, Response, Side,
 };
 use futures::FutureExt;
-use jcp::{Adapter, Config, Transport};
+use jcp::{Adapter, AgentOutgoingMessage, ClientOutgoingMessage, Config, Transport};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, value::RawValue};
 use std::io;
@@ -47,7 +46,7 @@ impl TestHarness {
         let (downlink_adapter, downlink_test) = ChannelTransport::pair(10);
         let (uplink_adapter, uplink_test) = ChannelTransport::pair(10);
 
-        let adapter = Adapter::new(config, downlink_adapter, uplink_adapter);
+        let adapter = Adapter::new(Ok(config), downlink_adapter, uplink_adapter);
 
         Self {
             adapter,
@@ -72,12 +71,11 @@ impl TestHarness {
         let id = RequestId::Number(self.next_request_id as i64);
         self.next_request_id += 1;
 
-        let msg =
-            JsonRpcMessage::wrap(OutgoingMessage::Request::<ClientSide, AgentSide>(Request {
-                id: id.clone(),
-                method: request.method().to_string().into(),
-                params: Some(request),
-            }));
+        let msg = JsonRpcMessage::wrap(ClientOutgoingMessage::Request(Request {
+            id: id.clone(),
+            method: request.method().to_string().into(),
+            params: Some(request),
+        }));
 
         let value = serde_json::to_value(&msg).unwrap();
         let _ = now_or_panic!(self.client.send(value));
@@ -133,9 +131,10 @@ impl TestHarness {
 
     /// Send a response from the server back to the adapter.
     pub fn server_reply(&mut self, id: RequestId, response: AgentResponse) {
-        let msg = JsonRpcMessage::wrap(OutgoingMessage::Response::<AgentSide, ClientSide>(
-            Response::new(id, Ok::<_, agent_client_protocol::Error>(response)),
-        ));
+        let msg = JsonRpcMessage::wrap(AgentOutgoingMessage::Response(Response::new(
+            id,
+            Ok(response),
+        )));
 
         let value = serde_json::to_value(&msg).unwrap();
         let _ = now_or_panic!(self.server.send(value));

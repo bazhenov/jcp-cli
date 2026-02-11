@@ -1,21 +1,21 @@
 use agent_client_protocol::{
     AgentNotification, AgentResponse, AgentSide, ClientRequest, ClientSide, ContentBlock,
     ContentChunk, InitializeRequest, InitializeResponse, JsonRpcMessage, NewSessionRequest,
-    NewSessionResponse, Notification, OutgoingMessage, PromptRequest, PromptResponse,
-    ProtocolVersion, RawValue, Request, RequestId, Response, SessionNotification, SessionUpdate,
-    Side, StopReason, TextContent,
+    NewSessionResponse, Notification, PromptRequest, PromptResponse, ProtocolVersion, RawValue,
+    Request, RequestId, Response, SessionNotification, SessionUpdate, Side, StopReason,
+    TextContent,
 };
-use serde::Deserialize;
-use serde::de::DeserializeOwned;
-use std::io::Read;
+use jcp::{AgentOutgoingMessage, ClientOutgoingMessage, JSON_RPC_ERROR_INVALID_PARAMS};
+use serde::{Deserialize, de::DeserializeOwned};
 use std::{
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
     net::TcpListener,
     path::PathBuf,
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     str::FromStr,
     thread::{self, JoinHandle},
 };
+use tempfile::tempdir;
 use tungstenite::{Message, Utf8Bytes, WebSocket};
 use url::Url;
 
@@ -32,26 +32,20 @@ fn help() {
 
 #[test]
 fn prompt_turn() {
-    let mut e2e = E2eHarness::bootstrap();
+    let mut e2e = E2eHarness::bootstrap(Default::default());
 
     // Step 1: Initialize handshake
-    let (response, _) = e2e.client_send::<InitializeResponse>(ClientRequest::InitializeRequest(
-        InitializeRequest::new(ProtocolVersion::V1),
-    ));
-    assert_eq!(response.protocol_version, ProtocolVersion::V1);
+    e2e.initialize_check().unwrap();
 
     // Step 2: Creating a new session
-    let (response, _) = e2e.client_send::<NewSessionResponse>(ClientRequest::NewSessionRequest(
-        NewSessionRequest::new("./"),
-    ));
-    assert!(!response.session_id.0.is_empty());
-
-    let prompt = ContentBlock::Text(TextContent::new("Prompt"));
+    let response = e2e.new_session_check().unwrap();
 
     // Step 3: prompt turn
+    let prompt = ContentBlock::Text(TextContent::new("Prompt"));
     let prompt_request = PromptRequest::new(response.session_id, vec![prompt.clone()]);
     let (response, mut notifications) =
-        e2e.client_send::<PromptResponse>(ClientRequest::PromptRequest(prompt_request));
+        e2e.client_request::<PromptResponse>(ClientRequest::PromptRequest(prompt_request));
+    let response = response.unwrap();
     assert_eq!(response.stop_reason, StopReason::EndTurn);
     assert_eq!(
         notifications.len(),
@@ -67,6 +61,30 @@ fn prompt_turn() {
     };
 }
 
+#[test]
+fn run_outside_git_directory() {
+    let tmp_dir = tempdir().unwrap();
+    let mut e2e = E2eHarness::bootstrap(E2eConfig {
+        // spawning in empty directory without git
+        project_dir: Some(tmp_dir.path().to_path_buf()),
+        supress_stderr: true,
+        ..Default::default()
+    });
+
+    match e2e.initialize_check() {
+        Ok(r) => panic!("JSON RPC error is expected. Got: {r:?}"),
+        Err(e) => {
+            assert_eq!(e.code, JSON_RPC_ERROR_INVALID_PARAMS);
+            assert!(
+                e.message
+                    .contains("Program should be run in git working copy."),
+                "Expect git error message, got: {}",
+                e.message
+            );
+        }
+    }
+}
+
 /// E2E test harness that manages mock server and jcp processes.
 ///
 /// Starts an in-process mock ACP server on a background task
@@ -80,9 +98,18 @@ struct E2eHarness {
     server_handle: Option<JoinHandle<()>>,
 }
 
+#[derive(Default)]
+#[non_exhaustive]
+struct E2eConfig {
+    project_dir: Option<PathBuf>,
+    /// If true, stderr of jcp binary will be sent to /dev/null
+    /// Set it if test scenario expects to generate errors/warning is jcp binary
+    supress_stderr: bool,
+}
+
 impl E2eHarness {
     /// Start the mock server and jcp process, ready for testing.
-    fn bootstrap() -> Self {
+    fn bootstrap(config: E2eConfig) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("Unable to bind socket");
 
         let addr = listener.local_addr().unwrap();
@@ -90,45 +117,77 @@ impl E2eHarness {
 
         let server_handle = thread::spawn(move || serve_acp_client(listener));
 
-        let jcp = ChildProcess::spawn(
-            get_jcp_binary_path(),
-            &["acp"],
-            &[
-                ("JCP_URL", url.as_str()),
-                ("AI_PLATFORM_TOKEN", "test-token"),
-                ("JBA_ACCESS_TOKEN", "test-access-token"),
-            ],
-        );
+        let mut cmd = Command::new(get_jcp_binary_path());
+        cmd.args(["acp"])
+            .env("JCP_URL", url.as_str())
+            .env("AI_PLATFORM_TOKEN", "test-token")
+            .env("JBA_ACCESS_TOKEN", "test-access-token")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped());
+
+        if let Some(project_dir) = config.project_dir {
+            cmd.current_dir(project_dir);
+        }
+        if config.supress_stderr {
+            cmd.stderr(Stdio::null());
+        }
+
+        let mut child = cmd.spawn().expect("Failed to spawn child process");
+        let stdin = child.stdin.take().unwrap();
+        let stdout = BufReader::new(child.stdout.take().unwrap());
 
         Self {
-            jcp,
+            jcp: ChildProcess {
+                child,
+                stdin,
+                stdout,
+            },
             next_request_id: 1,
             server_handle: Some(server_handle),
         }
     }
 
+    /// Does initialization and basic checks
+    #[track_caller]
+    fn initialize_check(&mut self) -> Result<InitializeResponse, RpcError> {
+        let (response, _) = self.client_request::<InitializeResponse>(
+            ClientRequest::InitializeRequest(InitializeRequest::new(ProtocolVersion::V1)),
+        );
+        let response = response?;
+        assert_eq!(response.protocol_version, ProtocolVersion::V1);
+        Ok(response)
+    }
+
+    fn new_session_check(&mut self) -> Result<NewSessionResponse, RpcError> {
+        let (response, _) = self.client_request::<NewSessionResponse>(
+            ClientRequest::NewSessionRequest(NewSessionRequest::new("./")),
+        );
+        let response = response?;
+        assert!(!response.session_id.0.is_empty());
+        Ok(response)
+    }
+
     /// Send a typed request and receive a typed response as well as all notifications that were sent by an agent
     /// while the request was executed.
-    fn client_send<T: DeserializeOwned>(
+    fn client_request<T: DeserializeOwned>(
         &mut self,
         request: ClientRequest,
-    ) -> (T, Vec<AgentNotification>) {
+    ) -> (Result<T, RpcError>, Vec<AgentNotification>) {
         let request_id = self.next_request_id;
         self.next_request_id += 1;
 
-        let msg =
-            JsonRpcMessage::wrap(OutgoingMessage::Request::<ClientSide, AgentSide>(Request {
-                id: RequestId::Number(request_id),
-                method: request.method().to_string().into(),
-                params: Some(request),
-            }));
+        let msg = JsonRpcMessage::wrap(ClientOutgoingMessage::Request(Request {
+            id: RequestId::Number(request_id),
+            method: request.method().to_string().into(),
+            params: Some(request),
+        }));
 
         let json = serde_json::to_string(&msg).expect("Failed to serialize request");
         self.jcp.send_line(&json);
 
         let mut notifications: Vec<AgentNotification> = vec![];
 
-        let msg = loop {
+        let response = loop {
             let line = self.jcp.read_line();
             let rpc_message: RawIncomingMessage =
                 serde_json::from_str(&line).expect("Failed to parse response JSON");
@@ -138,25 +197,34 @@ impl E2eHarness {
                 rpc_message.method,
                 rpc_message.params,
                 rpc_message.result,
+                rpc_message.error,
             ) {
                 // Response handling
-                (Some(RequestId::Number(id)), None, None, Some(result)) => {
+                (Some(RequestId::Number(id)), None, None, Some(result), None) => {
                     assert_eq!(
                         request_id, id,
                         "Incoming response is expected to have id {id}, got {request_id} instead"
                     );
-                    break serde_json::from_str(result.get())
-                        .expect("Failed to deserialize response result");
+                    break Ok(serde_json::from_str(result.get())
+                        .expect("Failed to deserialize response result"));
                 }
                 // Notifications handling
-                (None, Some(method), params, None) => {
+                (None, Some(method), params, None, None) => {
                     notifications
                         .push(ClientSide::decode_notification(method, params).expect("Unable"));
+                }
+                // Error handling
+                (Some(RequestId::Number(id)), None, None, None, Some(error)) => {
+                    assert_eq!(
+                        request_id, id,
+                        "Incoming response is expected to have id {id}, got {request_id} instead"
+                    );
+                    break Err(error);
                 }
                 _ => panic!("Unexpected payload: {line}"),
             }
         };
-        (msg, notifications)
+        (response, notifications)
     }
 }
 
@@ -169,6 +237,13 @@ impl Drop for E2eHarness {
     }
 }
 
+/// Because ACP is a duplex protocol (requests can be initiated not only by a client, but also by a server)
+/// we can not use standart JSON RPC crates for working with transport messages. Those crates assumes that
+/// each party know what is expected (request/notification, response, error) when reading next message
+/// from a transport.
+///
+/// This is a JsonRpc payload messages that covers all 3 types of JSON-RPC messages:
+/// request/notification, response, error.
 #[derive(Debug, Deserialize)]
 struct RawIncomingMessage<'a> {
     #[serde(rename = "id")]
@@ -182,6 +257,17 @@ struct RawIncomingMessage<'a> {
 
     #[serde(rename = "result")]
     result: Option<&'a RawValue>,
+
+    #[serde(rename = "error")]
+    error: Option<RpcError>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RpcError {
+    #[serde(rename = "code")]
+    code: i32,
+    #[serde(rename = "message")]
+    message: String,
 }
 
 /// Serves a mock WS/ACP server.
@@ -192,8 +278,6 @@ struct RawIncomingMessage<'a> {
 /// 2. on all prompts server reply with the same content
 /// 3. server is single user. After first user disconnects server exits
 fn serve_acp_client(listener: TcpListener) {
-    type AgentOutgoingMessage = OutgoingMessage<AgentSide, ClientSide>;
-
     fn send_jrpc<S: Read + Write>(ws: &mut WebSocket<S>, msg: AgentOutgoingMessage) {
         let json = serde_json::to_string(&JsonRpcMessage::wrap(msg)).expect("Failed serializing");
         // We don't really care about sending errors.
@@ -267,24 +351,6 @@ struct ChildProcess {
 }
 
 impl ChildProcess {
-    fn spawn(program: PathBuf, args: &[&str], env: &[(&str, &str)]) -> Self {
-        let mut cmd = Command::new(program);
-        cmd.args(args).stdin(Stdio::piped()).stdout(Stdio::piped());
-        for (key, value) in env {
-            cmd.env(key, value);
-        }
-
-        let mut child = cmd.spawn().expect("Failed to spawn child process");
-        let stdin = child.stdin.take().unwrap();
-        let stdout = BufReader::new(child.stdout.take().unwrap());
-
-        Self {
-            child,
-            stdin,
-            stdout,
-        }
-    }
-
     fn send_line(&mut self, line: &str) {
         // It's important to send newline character, so that transport will trigger on a new message
         writeln!(self.stdin, "{}", line).expect("Failed to write to child stdin");
