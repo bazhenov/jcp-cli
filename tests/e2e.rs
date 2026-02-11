@@ -7,10 +7,9 @@ use agent_client_protocol::{
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
-use serde_json::Value;
 use std::io::Read;
 use std::{
-    io::{self, BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Write},
     net::TcpListener,
     path::PathBuf,
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
@@ -108,20 +107,18 @@ impl E2eHarness {
         }
     }
 
-    /// Send a typed request and receive a typed response.
-    ///
-    /// Serializes the request as a JSON-RPC message, sends it via stdin,
-    /// reads the response line from stdout, and deserializes the `result` field.
+    /// Send a typed request and receive a typed response as well as all notifications that were sent by an agent
+    /// while the request was executed.
     fn client_send<T: DeserializeOwned>(
         &mut self,
         request: ClientRequest,
     ) -> (T, Vec<AgentNotification>) {
-        let id = self.next_request_id;
+        let request_id = self.next_request_id;
         self.next_request_id += 1;
 
         let msg =
             JsonRpcMessage::wrap(OutgoingMessage::Request::<ClientSide, AgentSide>(Request {
-                id: RequestId::Number(id),
+                id: RequestId::Number(request_id),
                 method: request.method().to_string().into(),
                 params: Some(request),
             }));
@@ -133,23 +130,30 @@ impl E2eHarness {
 
         let msg = loop {
             let line = self.jcp.read_line();
-            let mut rpc_message: Value =
+            let rpc_message: RawIncomingMessage =
                 serde_json::from_str(&line).expect("Failed to parse response JSON");
 
-            if !matches!(rpc_message["id"], Value::Null) {
-                let request_id: i64 =
-                    serde_json::from_value(rpc_message["id"].take()).expect("Unable to read id");
-                assert_eq!(
-                    request_id, id,
-                    "Incoming response is expected to have id {id}, got {request_id} instead"
-                );
-                break serde_json::from_value(rpc_message["result"].take())
-                    .expect("Failed to deserialize response result");
-            } else {
-                let raw: RawIncomingMessage<'_> = serde_json::from_str(&line).unwrap();
-                let method = raw.method.expect("No method given in JSON RPC");
-                notifications
-                    .push(ClientSide::decode_notification(method, raw.params).expect("Unable"));
+            match (
+                rpc_message.id,
+                rpc_message.method,
+                rpc_message.params,
+                rpc_message.result,
+            ) {
+                // Response handling
+                (Some(RequestId::Number(id)), None, None, Some(result)) => {
+                    assert_eq!(
+                        request_id, id,
+                        "Incoming response is expected to have id {id}, got {request_id} instead"
+                    );
+                    break serde_json::from_str(result.get())
+                        .expect("Failed to deserialize response result");
+                }
+                // Notifications handling
+                (None, Some(method), params, None) => {
+                    notifications
+                        .push(ClientSide::decode_notification(method, params).expect("Unable"));
+                }
+                _ => panic!("Unexpected payload: {line}"),
             }
         };
         (msg, notifications)
@@ -175,6 +179,9 @@ struct RawIncomingMessage<'a> {
 
     #[serde(rename = "params")]
     params: Option<&'a RawValue>,
+
+    #[serde(rename = "result")]
+    result: Option<&'a RawValue>,
 }
 
 /// Serves a mock WS/ACP server.
