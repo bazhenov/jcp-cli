@@ -1,13 +1,20 @@
 use agent_client_protocol::{
-    AgentSide, ClientRequest, ClientSide, InitializeRequest, InitializeResponse, JsonRpcMessage,
-    NewSessionRequest, NewSessionResponse, OutgoingMessage, ProtocolVersion, Request, RequestId,
+    AgentResponse, AgentSide, ClientRequest, ClientSide, ContentBlock, InitializeRequest,
+    InitializeResponse, JsonRpcMessage, NewSessionRequest, NewSessionResponse, OutgoingMessage,
+    PromptRequest, PromptResponse, ProtocolVersion, RawValue, Request, RequestId, Response, Side,
+    StopReason, TextContent,
 };
+use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use std::{
     io::{BufRead, BufReader, Write},
+    net::TcpListener,
     path::PathBuf,
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+    str::FromStr,
+    thread::{self, JoinHandle},
 };
+use tungstenite::{Message, Utf8Bytes};
 use url::Url;
 
 #[test]
@@ -25,7 +32,7 @@ fn help() {
 fn prompt_turn() {
     let mut e2e = E2eHarness::bootstrap();
 
-    // Step 1: Initialize handshale
+    // Step 1: Initialize handshake
     let response: InitializeResponse = e2e.client_send(ClientRequest::InitializeRequest(
         InitializeRequest::new(ProtocolVersion::V1),
     ));
@@ -36,42 +43,39 @@ fn prompt_turn() {
         NewSessionRequest::new("./"),
     ));
     assert!(!response.session_id.0.is_empty());
+
+    // Step 3: prompt turn
+    let prompt = PromptRequest::new(
+        response.session_id,
+        vec![ContentBlock::Text(TextContent::new("Prompt"))],
+    );
+    let response: PromptResponse = e2e.client_send(ClientRequest::PromptRequest(prompt));
+    assert_eq!(response.stop_reason, StopReason::EndTurn);
+
+    e2e.shutdown();
 }
 
 /// E2E test harness that manages mock server and jcp processes.
 ///
-/// Spawns `agent_mock_server` and `jcp acp`, providing a typed API
-/// for sending client requests and receiving responses.
+/// Starts an in-process mock ACP server on a background tokio task
+/// and spawns `jcp acp`, providing a typed API for sending client
+/// requests and receiving responses.
 struct E2eHarness {
     jcp: ChildProcess,
-    mock_server: Child,
     next_request_id: i64,
+    mock_server_handle: Option<JoinHandle<Result<(), tungstenite::Error>>>,
 }
 
 impl E2eHarness {
-    /// Spawn the mock server and jcp process, ready for testing.
+    /// Start the mock server and jcp process, ready for testing.
     fn bootstrap() -> Self {
-        let mut mock_server = Command::new(get_agent_mock_server_binary_path())
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("Failed to start mock server");
-
-        let stdout = mock_server.stdout.take().unwrap();
-        let mut reader = BufReader::new(stdout);
-        let mut url = String::new();
-        reader.read_line(&mut url).unwrap();
-        let url_str = url.trim().to_string();
-        if let Err(e) = Url::parse(&url_str) {
-            eprintln!("Invalid url: {url_str}");
-            eprintln!("First line expected to be an URL: {e}");
-            panic!();
-        }
+        let (url, server_handle) = start_mock_server();
 
         let jcp = ChildProcess::spawn(
             get_jcp_binary_path(),
             &["acp"],
             &[
-                ("JCP_URL", &url_str),
+                ("JCP_URL", url.as_str()),
                 ("AI_PLATFORM_TOKEN", "test-token"),
                 ("JBA_ACCESS_TOKEN", "test-access-token"),
             ],
@@ -79,8 +83,8 @@ impl E2eHarness {
 
         Self {
             jcp,
-            mock_server,
             next_request_id: 1,
+            mock_server_handle: Some(server_handle),
         }
     }
 
@@ -115,13 +119,89 @@ impl E2eHarness {
         serde_json::from_value(response["result"].clone())
             .expect("Failed to deserialize response result")
     }
+
+    fn shutdown(mut self) {
+        if let Some(server_join_handle) = self.mock_server_handle.take() {
+            self.jcp.child.kill().ok();
+            self.jcp.child.wait().ok();
+            server_join_handle.join().ok();
+        }
+    }
 }
 
+/// It's preferential to use [`Self::shutdown()`]
 impl Drop for E2eHarness {
     fn drop(&mut self) {
-        self.mock_server.kill().ok();
-        self.mock_server.wait().ok();
+        if let Some(server_join_handle) = self.mock_server_handle.take() {
+            self.jcp.child.kill().ok();
+            self.jcp.child.wait().ok();
+            server_join_handle.join().ok();
+        }
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct RawIncomingMessage<'a> {
+    #[serde(rename = "id")]
+    id: Option<RequestId>,
+
+    #[serde(rename = "method")]
+    method: Option<&'a str>,
+
+    #[serde(rename = "params")]
+    params: Option<&'a RawValue>,
+}
+
+/// Start a mock ACP server on a random port.
+fn start_mock_server() -> (Url, JoinHandle<Result<(), tungstenite::Error>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind mock server");
+    let addr = listener.local_addr().unwrap();
+    let url = Url::from_str(&format!("ws://{addr}")).unwrap();
+
+    let join_handle = thread::spawn(move || {
+        let (tcp_stream, _) = listener.accept().unwrap();
+        let mut ws = tungstenite::accept(tcp_stream).unwrap();
+
+        loop {
+            let msg = match ws.read() {
+                Ok(msg) => msg,
+                Err(tungstenite::Error::ConnectionClosed) => return Ok(()),
+                Err(e) => return Err(e),
+            };
+
+            let Message::Text(text) = msg else {
+                continue;
+            };
+
+            let raw: RawIncomingMessage<'_> = serde_json::from_str(&text).unwrap();
+            let Some((method, id)) = raw.method.zip(raw.id) else {
+                continue;
+            };
+
+            let request = AgentSide::decode_request(method, raw.params).unwrap();
+            let response = match request {
+                ClientRequest::InitializeRequest(req) => {
+                    AgentResponse::InitializeResponse(InitializeResponse::new(req.protocol_version))
+                }
+                ClientRequest::NewSessionRequest(_) => {
+                    AgentResponse::NewSessionResponse(NewSessionResponse::new("1"))
+                }
+                ClientRequest::PromptRequest(_) => {
+                    AgentResponse::PromptResponse(PromptResponse::new(StopReason::EndTurn))
+                }
+                _ => continue,
+            };
+
+            let msg = JsonRpcMessage::wrap(OutgoingMessage::Response::<AgentSide, ClientSide>(
+                Response::new(id, Ok::<_, agent_client_protocol::Error>(response)),
+            ));
+
+            let json = serde_json::to_string(&msg).unwrap();
+            ws.send(Message::Text(Utf8Bytes::from(json))).unwrap();
+        }
+    });
+
+    (url, join_handle)
 }
 
 /// A simple wrapper around a child process with piped stdin/stdout.
@@ -174,14 +254,6 @@ impl Drop for ChildProcess {
 
 fn get_jcp_binary_path() -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_BIN_EXE_jcp"));
-    if cfg!(windows) {
-        path.set_extension("exe");
-    }
-    path
-}
-
-fn get_agent_mock_server_binary_path() -> PathBuf {
-    let mut path = PathBuf::from(env!("CARGO_BIN_EXE_agent_mock_server"));
     if cfg!(windows) {
         path.set_extension("exe");
     }
