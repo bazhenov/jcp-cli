@@ -67,7 +67,7 @@ fn run_outside_git_directory() {
     let mut e2e = E2eHarness::bootstrap(E2eConfig {
         // spawning in empty directory without git
         project_dir: Some(tmp_dir.path().to_path_buf()),
-        supress_stderr: true,
+        suppress_stderr: true,
         ..Default::default()
     });
 
@@ -104,7 +104,7 @@ struct E2eConfig {
     project_dir: Option<PathBuf>,
     /// If true, stderr of jcp binary will be sent to /dev/null
     /// Set it if test scenario expects to generate errors/warning is jcp binary
-    supress_stderr: bool,
+    suppress_stderr: bool,
 }
 
 impl E2eHarness {
@@ -128,7 +128,7 @@ impl E2eHarness {
         if let Some(project_dir) = config.project_dir {
             cmd.current_dir(project_dir);
         }
-        if config.supress_stderr {
+        if config.suppress_stderr {
             cmd.stderr(Stdio::null());
         }
 
@@ -238,7 +238,7 @@ impl Drop for E2eHarness {
 }
 
 /// Because ACP is a duplex protocol (requests can be initiated not only by a client, but also by a server)
-/// we can not use standart JSON RPC crates for working with transport messages. Those crates assumes that
+/// we can not use standard JSON RPC crates for working with transport messages. Those crates assumes that
 /// each party know what is expected (request/notification, response, error) when reading next message
 /// from a transport.
 ///
