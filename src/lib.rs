@@ -217,7 +217,7 @@ pub struct RawIncomingMessage<'a> {
 /// This struct processes messages from both channels using `tokio::select!`,
 /// allowing for synchronous test-driving without spawning separate tasks.
 pub struct Adapter<Downlink, Uplink> {
-    /// Can be missing, in which case adapter should report arror on initialize handlshake
+    /// Can be missing, in which case adapter should report error on initialize handlshake
     config: Result<Config, String>,
     downlink: Downlink,
     uplink: Uplink,

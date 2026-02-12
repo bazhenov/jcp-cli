@@ -91,7 +91,7 @@ fn run_outside_git_directory() {
 /// and spawns `jcp acp`, providing a typed API for sending client
 /// requests and receiving responses.
 ///
-/// Needs to be shutted down using [`Self::shutdown()`].
+/// Needs to be shut down using [`Self::shutdown()`].
 struct E2eHarness {
     jcp: ChildProcess,
     next_request_id: i64,
