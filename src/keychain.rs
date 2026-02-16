@@ -7,6 +7,12 @@
 
 use std::io;
 
+#[cfg(target_os = "macos")]
+pub use macos::platform_keychain;
+
+#[cfg(target_os = "linux")]
+pub use linux::platform_keychain;
+
 /// Account name for storing the OAuth refresh token
 const REFRESH_TOKEN_KEY: &str = "refresh-token";
 
@@ -36,20 +42,80 @@ pub trait SecretBackend {
     fn delete_secret(&self, name: &str) -> io::Result<()>;
 }
 
-#[cfg(target_os = "macos")]
-pub fn platform_keychain() -> Box<dyn SecretBackend> {
-    // This conditional compilation is little bit cryptic, but it does
-    // make sure that whatever profile we building (release/debug) we don't
-    // get dead code warning, without any explicit `#[allow(dead_code)]`
-    #[cfg(debug_assertions)]
-    if cfg!(debug_assertions) {
-        Box::new(file::FileBackend::new())
-    } else {
-        Box::new(macos::MacOsBackend)
+#[cfg(target_os = "linux")]
+mod linux {
+    use std::collections::HashMap;
+    use std::sync::LazyLock;
+
+    use super::*;
+    use libsecret::*;
+
+    pub fn platform_keychain() -> Box<dyn SecretBackend> {
+        // This conditional compilation is little bit cryptic, but it does
+        // make sure that whatever profile we building (release/debug) we don't
+        // get dead code warning, without any explicit `#[allow(dead_code)]`
+        #[cfg(debug_assertions)]
+        if cfg!(debug_assertions) {
+            Box::new(file::FileBackend::new())
+        } else {
+            Box::new(LibsecretBackend)
+        }
+
+        #[cfg(not(debug_assertions))]
+        Box::new(LibsecretBackend)
     }
 
-    #[cfg(not(debug_assertions))]
-    Box::new(macos::MacOsBackend)
+    const NAME_ATTRIBUTE_KEY: &str = "name";
+
+    /// Wrapper providing Sync and Send impl for libsecret::Schema to allow the use with LazyLock.
+    struct SchemaHandle {
+        schema: Schema,
+    }
+
+    unsafe impl Send for SchemaHandle {}
+    unsafe impl Sync for SchemaHandle {}
+
+    static SCHEMA: LazyLock<SchemaHandle> = LazyLock::new(|| {
+        let mut attributes = HashMap::new();
+        attributes.insert(NAME_ATTRIBUTE_KEY, SchemaAttributeType::String);
+
+        let schema = Schema::new("com.jetbrains.acp-jcp", SchemaFlags::NONE, attributes);
+
+        SchemaHandle { schema }
+    });
+
+    struct LibsecretBackend;
+
+    impl SecretBackend for LibsecretBackend {
+        fn read_secret(&self, name: &str) -> io::Result<Option<String>> {
+            let mut attributes = HashMap::new();
+            attributes.insert(NAME_ATTRIBUTE_KEY, name);
+            password_lookup_sync(Some(&SCHEMA.schema), attributes, gio::Cancellable::NONE)
+                .map_err(io::Error::other)
+                .map(|maybe_gstring| maybe_gstring.map(|gstring| gstring.to_string()))
+        }
+
+        fn write_secret(&self, name: &str, value: &str) -> io::Result<()> {
+            let mut attributes = HashMap::new();
+            attributes.insert(NAME_ATTRIBUTE_KEY, name);
+            password_store_sync(
+                Some(&SCHEMA.schema),
+                attributes,
+                Some(&COLLECTION_DEFAULT),
+                "JetBrains ACP JCP Password",
+                value,
+                gio::Cancellable::NONE,
+            )
+            .map_err(io::Error::other)
+        }
+
+        fn delete_secret(&self, name: &str) -> io::Result<()> {
+            let mut attributes = HashMap::new();
+            attributes.insert(NAME_ATTRIBUTE_KEY, name);
+            password_clear_sync(Some(&SCHEMA.schema), attributes, gio::Cancellable::NONE)
+                .map_err(io::Error::other)
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -59,6 +125,21 @@ mod macos {
     use security_framework::passwords::{
         delete_generic_password, get_generic_password, set_generic_password,
     };
+
+    pub fn platform_keychain() -> Box<dyn SecretBackend> {
+        // This conditional compilation is little bit cryptic, but it does
+        // make sure that whatever profile we building (release/debug) we don't
+        // get dead code warning, without any explicit `#[allow(dead_code)]`
+        #[cfg(debug_assertions)]
+        if cfg!(debug_assertions) {
+            Box::new(file::FileBackend::new())
+        } else {
+            Box::new(MacOsBackend)
+        }
+
+        #[cfg(not(debug_assertions))]
+        Box::new(MacOsBackend)
+    }
 
     /// Service identifier for Keychain storage
     const SERVICE: &str = "com.jetbrains.acp-jcp";
