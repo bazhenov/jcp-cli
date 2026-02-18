@@ -13,6 +13,9 @@ pub use macos::platform_keychain;
 #[cfg(target_os = "linux")]
 pub use linux::platform_keychain;
 
+#[cfg(target_os = "windows")]
+pub use win32::platform_keychain;
+
 /// Account name for storing the OAuth refresh token
 const REFRESH_TOKEN_KEY: &str = "refresh-token";
 
@@ -40,6 +43,112 @@ pub trait SecretBackend {
 
     /// Delete a secret by name.
     fn delete_secret(&self, name: &str) -> io::Result<()>;
+}
+
+#[cfg(target_os = "windows")]
+mod win32 {
+    use std::ffi::{OsString, c_void};
+    use std::os::windows::ffi::OsStrExt;
+    use std::{iter, ptr};
+
+    use super::*;
+    use windows::Win32::Foundation::ERROR_NOT_FOUND;
+    use windows::Win32::Security::Credentials::{
+        CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC, CREDENTIALW, CredDeleteW, CredFree,
+        CredReadW, CredWriteW,
+    };
+    use windows::core::{PCWSTR, PWSTR};
+
+    pub fn platform_keychain() -> Box<dyn SecretBackend> {
+        // This conditional compilation is little bit cryptic, but it does
+        // make sure that whatever profile we building (release/debug) we don't
+        // get dead code warning, without any explicit `#[allow(dead_code)]`
+        #[cfg(debug_assertions)]
+        if cfg!(debug_assertions) {
+            Box::new(file::FileBackend::new())
+        } else {
+            Box::new(WindowsCredentialLockerBackend)
+        }
+
+        #[cfg(not(debug_assertions))]
+        Box::new(WindowsCredentialLockerBackend)
+    }
+
+    struct WindowsCredentialLockerBackend;
+
+    impl SecretBackend for WindowsCredentialLockerBackend {
+        fn read_secret(&self, name: &str) -> io::Result<Option<String>> {
+            let mut target_name = target_name(name);
+            let mut cred: *mut CREDENTIALW = ptr::null_mut();
+
+            unsafe {
+                match CredReadW(target_name.as_pwstr(), CRED_TYPE_GENERIC, None, &mut cred) {
+                    Err(e) if e.code() == ERROR_NOT_FOUND.to_hresult() => Ok(None),
+                    Err(e) => Err(e.into()),
+                    Ok(_) => {
+                        let blob_size = (*cred).CredentialBlobSize as usize;
+                        let mut blob = vec![0; blob_size];
+                        ptr::copy((*cred).CredentialBlob, blob.as_mut_ptr(), blob_size);
+
+                        CredFree(cred as *const c_void);
+
+                        Some(
+                            String::from_utf8(blob)
+                                .map_err(|_| io::Error::other("Secret blob corrupted")),
+                        )
+                        .transpose()
+                    }
+                }
+            }
+        }
+
+        fn write_secret(&self, name: &str, value: &str) -> io::Result<()> {
+            // CredentialBlob is a `*mut u8`, which is mutable. We technically can just force-cast
+            // the value, but that is undefined behaviour from the persppective of the type system.
+            let mut value_blob = Vec::from(value);
+            let mut target_name = target_name(name);
+
+            let cred = CREDENTIALW {
+                Type: CRED_TYPE_GENERIC,
+                TargetName: target_name.as_pwstr(),
+                CredentialBlob: value_blob.as_mut_ptr(),
+                CredentialBlobSize: value_blob.len().try_into().unwrap(),
+                Persist: CRED_PERSIST_LOCAL_MACHINE,
+                ..Default::default()
+            };
+
+            unsafe { CredWriteW(&cred, 0).map_err(Into::into) }
+        }
+
+        fn delete_secret(&self, name: &str) -> io::Result<()> {
+            let target_name = target_name(name);
+
+            unsafe {
+                CredDeleteW(target_name.as_pcwstr(), CRED_TYPE_GENERIC, None).map_err(Into::into)
+            }
+        }
+    }
+
+    fn target_name(name: &str) -> WideString {
+        WideString(
+            OsString::from(format!("JetBrains_ACP_JCP_{name}"))
+                .encode_wide()
+                .chain(iter::once(0))
+                .collect(),
+        )
+    }
+
+    struct WideString(Vec<u16>);
+
+    impl WideString {
+        fn as_pcwstr(&self) -> PCWSTR {
+            PCWSTR::from_raw(self.0.as_ptr())
+        }
+
+        fn as_pwstr(&mut self) -> PWSTR {
+            PWSTR::from_raw(self.0.as_mut_ptr())
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
