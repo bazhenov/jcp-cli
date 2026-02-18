@@ -42,6 +42,9 @@ security-framework = "3"
 libsecret = "0.8.0"
 gio = "0.21.5"
 
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62.2", features = ["Win32_Security_Credentials"] }
+
 [dev-dependencies]
 drop-check = { git = "https://github.com/bazhenov/drop-check" }
 tokio-test = "0.4"
