@@ -1,12 +1,14 @@
 use agent_client_protocol::{
-    self as acp, AgentSide, ClientRequest, ClientSide, JsonRpcMessage, NewSessionRequest,
-    OutgoingMessage, RawValue, Request, Response, Side,
+    self as acp, AgentNotification, AgentSide, CLIENT_METHOD_NAMES, ClientRequest, ClientSide,
+    ContentBlock, ContentChunk, JsonRpcMessage, NewSessionRequest, Notification, OutgoingMessage,
+    PromptResponse, RawValue, Request, RequestId, Response, SessionId, SessionNotification,
+    SessionUpdate, Side, StopReason, TextContent,
 };
 use futures::{FutureExt, Sink, Stream};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use std::io;
+use std::{collections::HashMap, io};
 use tokio::{
     fs::File,
     io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, Lines},
@@ -168,7 +170,7 @@ pub struct Config {
 impl Config {
     pub fn new_session_meta(&self) -> NewSessionMeta {
         NewSessionMeta {
-            remote: NewSessionRemote {
+            remote: GitRemoteInfo {
                 branch: self.branch.clone(),
                 url: self.git_url.clone(),
                 revision: self.revision.clone(),
@@ -182,7 +184,7 @@ impl Config {
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub struct NewSessionMeta {
     #[serde(rename = "remote")]
-    pub remote: NewSessionRemote,
+    pub remote: GitRemoteInfo,
 
     #[serde(rename = "jbAiToken")]
     pub ai_platform_token: String,
@@ -192,7 +194,13 @@ pub struct NewSessionMeta {
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
-pub struct NewSessionRemote {
+pub struct EndTurnMeta {
+    #[serde(rename = "target")]
+    pub target: GitRemoteInfo,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+pub struct GitRemoteInfo {
     #[serde(rename = "branch")]
     pub branch: String,
 
@@ -222,6 +230,11 @@ pub struct Adapter<Downlink, Uplink> {
     downlink: Downlink,
     uplink: Uplink,
     traffic_log: TrafficLog,
+
+    /// Mapping from prompt request id to session id
+    ///
+    /// We need this to be able to send prompt followups before prompt finished
+    prompt_request_mapping: HashMap<RequestId, SessionId>,
 }
 
 impl<Downlink, Uplink> Adapter<Downlink, Uplink>
@@ -239,6 +252,7 @@ where
             downlink,
             uplink,
             traffic_log: TrafficLog::default(),
+            prompt_request_mapping: HashMap::new(),
         }
     }
 
@@ -262,7 +276,7 @@ where
             msg = self.uplink.recv() => {
                 if let Some(msg) = msg? {
                     self.traffic_log.write(msg.clone()).await?;
-                    self.downlink.send(msg).await?;
+                    self.handle_agent_message(msg).await?;
                 }
             }
             else => return Ok(None),
@@ -282,13 +296,44 @@ where
         }
         while let Some(msg) = self.uplink.recv().now_or_never() {
             if let Some(msg) = msg? {
-                self.downlink.send(msg).await?;
+                self.handle_agent_message(msg).await?;
             }
         }
         Ok(())
     }
 
-    /// Handle a message from the client (uplink: client -> server)
+    /// Handles downlink messages (server -> client)
+    async fn handle_agent_message(&mut self, msg: JsonValue) -> io::Result<()> {
+        let request_id = serde_json::from_value::<RequestId>(msg["id"].clone()).ok();
+
+        if let Some(request_id) = request_id
+            && msg["result"] != JsonValue::Null
+            && let Some(session_id) = self.prompt_request_mapping.remove(&request_id)
+        {
+            // it is a response to a prompt request
+            let r = serde_json::from_value::<PromptResponse>(msg["result"].clone())
+                .map_err(to_io_invalid_data_err)?;
+            if r.stop_reason == StopReason::EndTurn
+                && let Some(meta) = r.meta
+            {
+                let remote_info = serde_json::from_value::<EndTurnMeta>(JsonValue::Object(meta));
+                let end_turn_message = remote_info
+                    .ok()
+                    .map(|r| r.target)
+                    .and_then(git_end_turn_message);
+                if let Some(message) = end_turn_message {
+                    let notification = create_session_update_notification(session_id, message);
+                    let value =
+                        serde_json::to_value(&notification).map_err(to_io_invalid_data_err)?;
+                    self.downlink.send(value).await?;
+                }
+            }
+        }
+
+        self.downlink.send(msg).await
+    }
+
+    /// Handles a message from the client (uplink: client -> server)
     async fn handle_client_message(&mut self, msg: JsonValue) -> io::Result<()> {
         // This is ugly hack, but we need to serialize here back to string, otherwise
         // we can not use AgentSide::decode_request()
@@ -301,6 +346,8 @@ where
                 .map_err(to_io_invalid_data_err)?;
 
             if let ClientRequest::InitializeRequest(_) = request {
+                // On InitializeRequest we need to check all important preciditions and fail
+                // query to report a error to user if any.
                 if let Err(e) = &self.config {
                     // no git config. Terminating protocol early
                     let msg =
@@ -314,15 +361,21 @@ where
                     return Err(io::Error::other(e.clone()));
                 }
             } else if let ClientRequest::NewSessionRequest(r) = &mut request {
-                // Assuming config present, because we checking it on a init phase
+                // On a NewSessionRequest we need to inject remote info (git url and branch)
+                //
+                // Assuming git config present, because we checking it on a init phase
                 let meta = self
                     .config
                     .as_ref()
                     .expect("No config found")
                     .new_session_meta();
                 inject_new_session_meta(r, &meta)?;
+            } else if let ClientRequest::PromptRequest(r) = &request {
+                self.prompt_request_mapping
+                    .insert(id.clone(), r.session_id.clone());
             }
 
+            // Sending message to the server
             let msg = JsonRpcMessage::wrap(ClientOutgoingMessage::Request(Request {
                 id,
                 method: method.into(),
@@ -343,6 +396,39 @@ where
         while self.handle_next_message().await?.is_some() {}
         Ok(())
     }
+}
+
+fn git_end_turn_message(git_info: GitRemoteInfo) -> Option<String> {
+    if !git_info.branch.is_empty() {
+        Some(format!(
+            "Results branch: {} ({})",
+            git_info.branch, git_info.url
+        ))
+    } else if !git_info.revision.is_empty() {
+        Some(format!(
+            "Results commit: #{} ({})",
+            git_info.revision, git_info.url
+        ))
+    } else {
+        None
+    }
+}
+
+fn create_session_update_notification(
+    session_id: SessionId,
+    message: impl Into<String>,
+) -> JsonRpcMessage<AgentOutgoingMessage> {
+    JsonRpcMessage::wrap(AgentOutgoingMessage::Notification(Notification {
+        method: CLIENT_METHOD_NAMES.session_update.into(),
+        params: Some(AgentNotification::SessionNotification(
+            SessionNotification::new(
+                session_id,
+                SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                    TextContent::new(message),
+                ))),
+            ),
+        )),
+    }))
 }
 
 #[derive(Default)]
@@ -404,13 +490,33 @@ mod tests {
                 "supportsUserGitAuthFlow": false
             }"#,
             NewSessionMeta {
-                remote: NewSessionRemote {
+                remote: GitRemoteInfo {
                     branch: "main".to_string(),
                     url: "https://example.com/repo.git".to_string(),
                     revision: "18adf27d36912b2e255c71327146ac21116e232f".to_string(),
                 },
                 ai_platform_token: "test_token".to_string(),
                 supports_user_git_auth_flow: false,
+            },
+        );
+    }
+
+    #[test]
+    fn test_end_turn_meta_deserialization() {
+        check_serialization(
+            r#"{
+                "target": {
+                    "branch":"main",
+                    "url":"https://example.com/repo.git",
+                    "revision":"18adf27d36912b2e255c71327146ac21116e232f"
+                }
+            }"#,
+            EndTurnMeta {
+                target: GitRemoteInfo {
+                    branch: "main".to_string(),
+                    url: "https://example.com/repo.git".to_string(),
+                    revision: "18adf27d36912b2e255c71327146ac21116e232f".to_string(),
+                },
             },
         );
     }
@@ -442,6 +548,36 @@ mod tests {
         if !matches!(request, ClientRequest::InitializeRequest(..)) {
             panic!("Unexpected request: {:?}", request);
         }
+    }
+
+    #[test]
+    fn check_git_finish_message() {
+        let url = "http://github.com/url";
+        let branch = "master";
+        let revision = "2b7a25df823dc7d8f56f8ce7c2d2dac391cea9c2";
+
+        let msg = git_end_turn_message(GitRemoteInfo {
+            branch: branch.to_owned(),
+            url: url.to_owned(),
+            revision: revision.to_owned(),
+        })
+        .unwrap();
+        assert!(msg.contains(url), "Message: {msg} does not contains {url}",);
+        assert!(
+            msg.contains(branch),
+            "Message: '{msg}' does not contain: {branch}",
+        );
+
+        let msg = git_end_turn_message(GitRemoteInfo {
+            branch: "".to_owned(),
+            url: url.to_owned(),
+            revision: revision.to_owned(),
+        })
+        .unwrap();
+        assert!(
+            msg.contains(revision),
+            "Message: '{msg}' does not contain: {branch}",
+        );
     }
 
     fn check_serialization<T>(json: &str, expected_value: T)
