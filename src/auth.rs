@@ -76,8 +76,8 @@ pub fn login() -> Result<String, AuthError> {
     );
     eprintln!("\n  {}\n", auth_url);
 
-    // Open browser
-    open::that(auth_url.to_string()).map_err(AuthError::BrowserOpen)?;
+    // We told user to open browser in case we failed, so ignore the error
+    let _ = open::that(auth_url.to_string());
 
     // Wait for callback
     let code = read_authorization_code_from_callback(server, csrf_token)?;
@@ -313,9 +313,6 @@ fn extract_query_param(url: &Url, param_name: &str) -> Option<String> {
 pub enum AuthError {
     #[error("Failed to start local callback server: {0}")]
     ServerStart(#[source] Box<dyn std::error::Error + Send + Sync>),
-
-    #[error("Failed to open browser for authentication: {0}")]
-    BrowserOpen(#[source] std::io::Error),
 
     #[error("OAuth server returned an error: {0}")]
     OAuthServer(String),

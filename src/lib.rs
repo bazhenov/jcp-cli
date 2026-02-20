@@ -224,11 +224,11 @@ pub struct RawIncomingMessage<'a> {
 ///
 /// This struct processes messages from both channels using `tokio::select!`,
 /// allowing for synchronous test-driving without spawning separate tasks.
-pub struct Adapter<Downlink, Uplink> {
+pub struct Adapter<ClientTransport, AgentTransport> {
     /// Can be missing, in which case adapter should report error on initialize handlshake
     config: Result<Config, String>,
-    downlink: Downlink,
-    uplink: Uplink,
+    client: ClientTransport,
+    agent: AgentTransport,
     traffic_log: TrafficLog,
 
     /// Mapping from prompt request id to session id
@@ -237,20 +237,24 @@ pub struct Adapter<Downlink, Uplink> {
     prompt_request_mapping: HashMap<RequestId, SessionId>,
 }
 
-impl<Downlink, Uplink> Adapter<Downlink, Uplink>
+impl<ClientTransport, AgentTransport> Adapter<ClientTransport, AgentTransport>
 where
-    Downlink: Transport,
-    Uplink: Transport,
+    ClientTransport: Transport,
+    AgentTransport: Transport,
 {
     /// Create a new adapter with the given configuration and transports.
     ///
     /// - `downlink`: transport to the client (IDE)
     /// - `uplink`: transport to the server (JCP)
-    pub fn new(config: Result<Config, String>, downlink: Downlink, uplink: Uplink) -> Self {
+    pub fn new(
+        config: Result<Config, String>,
+        client: ClientTransport,
+        agent: AgentTransport,
+    ) -> Self {
         Self {
             config,
-            downlink,
-            uplink,
+            client,
+            agent,
             traffic_log: TrafficLog::default(),
             prompt_request_mapping: HashMap::new(),
         }
@@ -262,26 +266,26 @@ where
 
     /// Process the next message from either the client or server channel.
     ///
-    /// Returns `Some(())` when a message was processed successfully.
-    /// Returns `None` when both channels are closed (end of communication).
-    pub async fn handle_next_message(&mut self) -> io::Result<Option<()>> {
+    /// Returns `true` if there are more messages can be handled
+    /// Returns `false` when both channels are closed (end of communication).
+    pub async fn handle_next_message(&mut self) -> io::Result<bool> {
         tokio::select! {
-            msg = self.downlink.recv() => {
+            msg = self.client.recv() => {
                 if let Some(msg) = msg? {
-                    self.traffic_log.write(msg.clone()).await?;
+                    let _ = self.traffic_log.write(&msg).await;
                     self.handle_client_message(msg).await?;
+                    return Ok(true)
                 }
-
             }
-            msg = self.uplink.recv() => {
+            msg = self.agent.recv() => {
                 if let Some(msg) = msg? {
-                    self.traffic_log.write(msg.clone()).await?;
+                    let _ = self.traffic_log.write(&msg).await;
                     self.handle_agent_message(msg).await?;
+                    return Ok(true)
                 }
             }
-            else => return Ok(None),
         }
-        Ok(Some(()))
+        Ok(false)
     }
 
     /// Handles all enqueued messages in the transport
@@ -289,12 +293,12 @@ where
     /// Should be used for tests only, because using this method in a loop will cause CPU spin.
     /// Use [`Self::handle_next_message()`] instead
     pub async fn handle_enqueued_messages(&mut self) -> io::Result<()> {
-        while let Some(msg) = self.downlink.recv().now_or_never() {
+        while let Some(msg) = self.client.recv().now_or_never() {
             if let Some(msg) = msg? {
                 self.handle_client_message(msg).await?;
             }
         }
-        while let Some(msg) = self.uplink.recv().now_or_never() {
+        while let Some(msg) = self.agent.recv().now_or_never() {
             if let Some(msg) = msg? {
                 self.handle_agent_message(msg).await?;
             }
@@ -325,12 +329,12 @@ where
                     let notification = create_session_update_notification(session_id, message);
                     let value =
                         serde_json::to_value(&notification).map_err(to_io_invalid_data_err)?;
-                    self.downlink.send(value).await?;
+                    self.client.send(value).await?;
                 }
             }
         }
 
-        self.downlink.send(msg).await
+        self.client.send(msg).await
     }
 
     /// Handles a message from the client (uplink: client -> server)
@@ -356,7 +360,7 @@ where
                             error: acp::Error::new(JSON_RPC_ERROR_INVALID_PARAMS, e),
                         }));
                     let value = serde_json::to_value(&msg).map_err(to_io_invalid_data_err)?;
-                    self.downlink.send(value).await?;
+                    self.client.send(value).await?;
 
                     return Err(io::Error::other(e.clone()));
                 }
@@ -383,17 +387,17 @@ where
             }));
 
             let value = serde_json::to_value(&msg).map_err(to_io_invalid_data_err)?;
-            self.uplink.send(value).await?;
+            self.agent.send(value).await?;
         } else {
             // Sending notifications to JCP without modification
-            self.uplink.send(msg).await?;
+            self.agent.send(msg).await?;
         }
         Ok(())
     }
 
     /// Run the adapter until both channels are closed.
     pub async fn run(&mut self) -> io::Result<()> {
-        while self.handle_next_message().await?.is_some() {}
+        while self.handle_next_message().await? {}
         Ok(())
     }
 }
@@ -446,9 +450,9 @@ impl TrafficLog {
         Ok(Self { file })
     }
 
-    pub async fn write(&mut self, msg: JsonValue) -> io::Result<()> {
+    pub async fn write(&mut self, msg: &JsonValue) -> io::Result<()> {
         if let Some(file) = &mut self.file {
-            let json = serde_json::to_string_pretty(&msg).map_err(to_io_invalid_data_err)?;
+            let json = serde_json::to_string_pretty(msg).map_err(to_io_invalid_data_err)?;
             file.write_all(json.as_bytes()).await
         } else {
             Ok(())
@@ -576,7 +580,7 @@ mod tests {
         .unwrap();
         assert!(
             msg.contains(revision),
-            "Message: '{msg}' does not contain: {branch}",
+            "Message: '{msg}' does not contain: {revision}",
         );
     }
 

@@ -60,7 +60,8 @@ enum Commands {
 }
 
 fn main() {
-    dotenv().ok();
+    // We don't want to fail if we can't read .env for whatever reason
+    let _ = dotenv();
 
     let cli = Cli::parse();
     let keychain = keychain::platform_keychain();
@@ -145,7 +146,6 @@ fn run_adapter(keychain: &dyn SecretBackend) {
             .handle_next_message()
             .await
             .expect("Unable to handle message")
-            .is_some()
         {}
     });
 }
