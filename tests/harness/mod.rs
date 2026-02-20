@@ -7,6 +7,7 @@ use agent_client_protocol::{
     JsonRpcMessage, NewSessionRequest, NewSessionResponse, ProtocolVersion, Request, RequestId,
     Response, SessionId,
 };
+use async_trait::async_trait;
 use futures::FutureExt;
 use jcp::{Adapter, AgentOutgoingMessage, ClientOutgoingMessage, Config, Transport};
 use serde::de::DeserializeOwned;
@@ -33,7 +34,7 @@ use tokio::sync::mpsc;
 /// are available for reading using [`TestHarness::agent_recv()`].
 pub struct TestHarness {
     /// The adapter instance
-    adapter: Adapter<ChannelTransport, ChannelTransport>,
+    adapter: Adapter,
     /// Transport endpoint for the client side (simulates IDE)
     client: ChannelTransport,
     /// Transport endpoint for the agent side (simulates JCP)
@@ -58,7 +59,11 @@ impl TestHarness {
         let (downlink_adapter, downlink_test) = ChannelTransport::pair(10);
         let (uplink_adapter, uplink_test) = ChannelTransport::pair(10);
 
-        let adapter = Adapter::new(Ok(config), downlink_adapter, uplink_adapter);
+        let adapter = Adapter::new(
+            Ok(config),
+            Box::new(downlink_adapter),
+            Box::new(uplink_adapter),
+        );
 
         Self {
             adapter,
@@ -189,6 +194,7 @@ impl ChannelTransport {
     }
 }
 
+#[async_trait]
 impl Transport for ChannelTransport {
     async fn recv(&mut self) -> io::Result<Option<JsonValue>> {
         Ok(self.rx.recv().await)

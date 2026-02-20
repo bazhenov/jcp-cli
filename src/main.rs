@@ -140,7 +140,7 @@ fn run_adapter(keychain: &dyn SecretBackend) {
         let downlink = IoTransport::new(stdin(), stdout());
         let uplink = WebSocketTransport::new(ws_rx, ws_tx);
 
-        let mut adapter = Adapter::new(config, downlink, uplink);
+        let mut adapter = Adapter::new(config, Box::new(downlink), Box::new(uplink));
         adapter.set_traffic_log(traffic_log);
         while adapter
             .handle_next_message()

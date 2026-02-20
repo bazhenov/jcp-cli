@@ -4,6 +4,7 @@ use agent_client_protocol::{
     PromptResponse, RawValue, Request, RequestId, Response, SessionId, SessionNotification,
     SessionUpdate, Side, StopReason, TextContent,
 };
+use async_trait::async_trait;
 use futures::{FutureExt, Sink, Stream};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -30,7 +31,7 @@ pub const JSON_RPC_ERROR_INVALID_PARAMS: i32 = -32602;
 ///
 /// This trait abstracts over different transport mechanisms (stdio, websocket, channels)
 /// providing a simple async interface for sending and receiving JSON values.
-#[allow(async_fn_in_trait)]
+#[async_trait]
 pub trait Transport {
     /// Receive the next message from the transport.
     /// Returns `Ok(None)` when the transport is closed.
@@ -63,6 +64,7 @@ impl IoTransport {
     }
 }
 
+#[async_trait]
 impl Transport for IoTransport {
     async fn recv(&mut self) -> io::Result<Option<JsonValue>> {
         // Lines::next_line() is cancellation safe per tokio documentation
@@ -101,6 +103,7 @@ impl WebSocketTransport {
     }
 }
 
+#[async_trait]
 impl Transport for WebSocketTransport {
     async fn recv(&mut self) -> io::Result<Option<JsonValue>> {
         loop {
@@ -224,11 +227,11 @@ pub struct RawIncomingMessage<'a> {
 ///
 /// This struct processes messages from both channels using `tokio::select!`,
 /// allowing for synchronous test-driving without spawning separate tasks.
-pub struct Adapter<ClientTransport, AgentTransport> {
+pub struct Adapter {
     /// Can be missing, in which case adapter should report error on initialize handlshake
     config: Result<Config, String>,
-    client: ClientTransport,
-    agent: AgentTransport,
+    client: Box<dyn Transport>,
+    agent: Box<dyn Transport>,
     traffic_log: TrafficLog,
 
     /// Mapping from prompt request id to session id
@@ -237,19 +240,15 @@ pub struct Adapter<ClientTransport, AgentTransport> {
     prompt_request_mapping: HashMap<RequestId, SessionId>,
 }
 
-impl<ClientTransport, AgentTransport> Adapter<ClientTransport, AgentTransport>
-where
-    ClientTransport: Transport,
-    AgentTransport: Transport,
-{
+impl Adapter {
     /// Create a new adapter with the given configuration and transports.
     ///
     /// - `downlink`: transport to the client (IDE)
     /// - `uplink`: transport to the server (JCP)
     pub fn new(
         config: Result<Config, String>,
-        client: ClientTransport,
-        agent: AgentTransport,
+        client: Box<dyn Transport>,
+        agent: Box<dyn Transport>,
     ) -> Self {
         Self {
             config,

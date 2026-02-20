@@ -941,6 +941,7 @@ name = "jcp"
 version = "0.1.1"
 dependencies = [
  "agent-client-protocol",
+ "async-trait",
  "clap",
  "dirs",
  "dotenv",
