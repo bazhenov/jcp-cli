@@ -149,6 +149,5 @@ fn test_config() -> Config {
         branch: TEST_BRANCH.into(),
         revision: TEST_REVISION.into(),
         ai_platform_token: TEST_TOKEN.into(),
-        supports_user_git_auth_flow: false,
     }
 }

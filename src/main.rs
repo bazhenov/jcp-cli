@@ -120,7 +120,6 @@ fn run_adapter(keychain: &dyn SecretBackend) {
             branch: git_info.branch,
             revision: git_info.revision,
             ai_platform_token,
-            supports_user_git_auth_flow: false,
         }),
         Err(e) => {
             let desc =
