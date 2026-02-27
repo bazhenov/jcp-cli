@@ -40,7 +40,7 @@ fn get_git_info() -> Result<GitInfo, String> {
 }
 
 #[derive(Parser)]
-#[command(name = "acp-jcp")]
+#[command(name = "jcp", version)]
 #[command(about = "ACP-JCP adapter for JetBrains Cloud Platform")]
 struct Cli {
     #[command(subcommand)]
