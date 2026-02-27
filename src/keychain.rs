@@ -20,7 +20,6 @@ pub trait SecretBackend {
         self.read_secret(REFRESH_TOKEN_KEY)
     }
 
-    #[allow(dead_code)]
     fn delete_refresh_token(&self) -> io::Result<()> {
         self.delete_secret(REFRESH_TOKEN_KEY)
     }
@@ -62,17 +61,23 @@ pub fn active_keychain() -> Box<dyn SecretBackend> {
 
 #[cfg(target_os = "windows")]
 mod win32 {
-    use std::ffi::{OsString, c_void};
-    use std::os::windows::ffi::OsStrExt;
-    use std::{iter, ptr};
-
     use super::*;
-    use windows::Win32::Foundation::ERROR_NOT_FOUND;
-    use windows::Win32::Security::Credentials::{
-        CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC, CREDENTIALW, CredDeleteW, CredFree,
-        CredReadW, CredWriteW,
+    use std::{
+        ffi::{OsString, c_void},
+        iter,
+        os::windows::ffi::OsStrExt,
+        ptr,
     };
-    use windows::core::{PCWSTR, PWSTR};
+    use windows::{
+        Win32::{
+            Foundation::ERROR_NOT_FOUND,
+            Security::Credentials::{
+                CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC, CREDENTIALW, CredDeleteW, CredFree,
+                CredReadW, CredWriteW,
+            },
+        },
+        core::{PCWSTR, PWSTR},
+    };
 
     pub fn platform_keychain() -> Box<dyn SecretBackend> {
         Box::new(WindowsCredentialLockerBackend)
@@ -157,14 +162,12 @@ mod win32 {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use std::collections::HashMap;
-    use std::sync::LazyLock;
-
     use super::*;
     use libsecret::{
         COLLECTION_DEFAULT, Schema, SchemaAttributeType, SchemaFlags, password_clear_sync,
         password_lookup_sync, password_store_sync,
     };
+    use std::{collections::HashMap, sync::LazyLock};
 
     pub fn platform_keychain() -> Box<dyn SecretBackend> {
         Box::new(LibsecretBackend)
