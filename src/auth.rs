@@ -3,8 +3,8 @@ use oauth2::{
     AuthUrl, AuthorizationCode, ClientId, CsrfToken, PkceCodeChallenge, RedirectUrl, Scope,
     TokenResponse, TokenUrl, basic::BasicClient,
 };
-use reqwest::{blocking::Client, redirect::Policy};
-use serde::Deserialize;
+use reqwest::{blocking::Client, header::ACCEPT, redirect::Policy};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 use tiny_http::{Response, Server};
@@ -19,11 +19,21 @@ const CLIENT_ID: &str = "air";
 /// JetBrains Cloud Platform API base URL
 const JCP_API_URL: &str = "https://api.stgn.jetbrainscloud.com";
 
+const LICENSE_API_URL: &str = "https://active.jetprofile-aip.intellij.net";
+
+const JB_AI_API_URL: &str = "https://api.stgn.jetbrains.ai";
+
 /// Agent Spawner audience for upgrading OAuth access token
 const JCP_AS_AUDIENCE: &str = "jcp-agent-spawner";
 
 /// The expected callback path for OAuth redirect
 const CALLBACK_PATH: &str = "/space/auth";
+
+/// Contains access tokens to JCP and JetBrains AI Platform
+pub struct AccessTokens {
+    pub jcp_access_token: String,
+    pub ai_access_token: String,
+}
 
 /// Performs OAuth browser login flow and returns a refresh token.
 ///
@@ -67,7 +77,9 @@ pub fn login() -> Result<String, AuthError> {
         .add_scope(Scope::new("offline_access".to_string()))
         .add_scope(Scope::new("openid".to_string()))
         .add_scope(Scope::new("org-service".to_string()))
-        .add_scope(Scope::new("jba".to_string()))
+        .add_scope(Scope::new("jba:r_profile".to_string()))
+        .add_scope(Scope::new("jba:r_ide_auth".to_string()))
+        .add_scope(Scope::new("jba:r_assets".to_string()))
         .set_pkce_challenge(pkce_challenge)
         .url();
 
@@ -98,22 +110,32 @@ pub fn login() -> Result<String, AuthError> {
 /// Converts a refresh token into a JCP access token.
 ///
 /// This function:
-/// 1. Uses the refresh token to get a fresh access token
+/// 1. Uses the JCP refresh token to get a fresh JCP access token and ID token
 /// 2. Fetches organization info from JCP
 /// 3. Switches the token audience to get a JCP-scoped token
+/// 4. reads the first AI license from JB AI platform and retrieves JB AI token
 ///
 /// Use this with a refresh token obtained from [`login()`].
-pub fn get_access_token(refresh_token: &str) -> Result<String, AuthError> {
+pub fn get_access_tokens(refresh_token: &str) -> Result<AccessTokens, AuthError> {
     let http_client = create_http_client()?;
 
-    // Refresh to get a new access token
-    let access_token = refresh_access_token(&http_client, refresh_token)?;
+    // Refresh to get a new access and ID tokens
+    let tokens = retrieve_jcp_access_and_id_tokens(&http_client, refresh_token)?;
 
     // Get organization info
-    let org_info = get_org_info(&http_client, &access_token)?;
+    let org_info = get_org_info(&http_client, &tokens.access_token)?;
+
+    let id_token = tokens.id_token.ok_or(AuthError::MissingIdToken)?;
 
     // Switch token audience for JCP access
-    switch_token_audience(&http_client, refresh_token, &org_info)
+    let jcp_access_token =
+        retrieve_jcp_scoped_access_token(&http_client, refresh_token, &org_info)?;
+    let ai_access_token = retrieve_ai_access_token(&http_client, &tokens.access_token, &id_token)?;
+
+    Ok(AccessTokens {
+        jcp_access_token,
+        ai_access_token,
+    })
 }
 
 /// Creates an HTTP client configured for OAuth operations.
@@ -124,7 +146,10 @@ fn create_http_client() -> Result<Client, AuthError> {
 }
 
 /// Refreshes an access token using a refresh token.
-fn refresh_access_token(http_client: &Client, refresh_token: &str) -> Result<String, AuthError> {
+fn retrieve_jcp_access_and_id_tokens(
+    http_client: &Client,
+    refresh_token: &str,
+) -> Result<OAuthTokenResponse, AuthError> {
     let token_url = format!("{}/oauth2/token", OAUTH_BASE_URL);
 
     let response = http_client
@@ -134,36 +159,24 @@ fn refresh_access_token(http_client: &Client, refresh_token: &str) -> Result<Str
             ("refresh_token", refresh_token),
             ("client_id", CLIENT_ID),
         ])
-        .send()?;
+        .send()?
+        .error_for_status()
+        .map_err(AuthError::TokenRefresh)?
+        .json()?;
 
-    let status = response.status().as_u16();
-    if status != 200 {
-        return Err(AuthError::TokenRefresh {
-            status,
-            body: response.text().unwrap_or_default(),
-        });
-    }
-
-    Ok(response.json::<OAuthTokenResponse>()?.access_token)
+    Ok(response)
 }
 
 /// Fetches organization info from JCP using the access token.
 fn get_org_info(http_client: &Client, access_token: &str) -> Result<OrgInfo, AuthError> {
-    let response = http_client
+    let raw_token = http_client
         .get(format!("{}/org/orgsuserinfo", JCP_API_URL))
         .bearer_auth(access_token)
         .header("Accept", "application/jwt")
-        .send()?;
-
-    let status = response.status().as_u16();
-    if status != 200 {
-        return Err(AuthError::OrgInfoFetch {
-            status,
-            body: response.text().unwrap_or_default(),
-        });
-    }
-
-    let raw_token = response.text()?;
+        .send()?
+        .error_for_status()
+        .map_err(AuthError::OrgInfoFetch)?
+        .text()?;
 
     // Parse JWT to extract organization ID
     let token: Token<Value, JcpTokenClaims, _> = Token::parse_unverified(&raw_token)?;
@@ -189,10 +202,45 @@ fn get_org_info(http_client: &Client, access_token: &str) -> Result<OrgInfo, Aut
     })
 }
 
+/// Reads JB AI Platform token linked to a AI-enabled license
+fn retrieve_ai_access_token(
+    http: &Client,
+    access_token: &str,
+    id_token: &str,
+) -> Result<String, AuthError> {
+    let license_id = http
+        .get(format!("{LICENSE_API_URL}/services/account/assets"))
+        .bearer_auth(access_token)
+        .header(ACCEPT, "application/json")
+        .send()?
+        .error_for_status()
+        .map_err(AuthError::License)?
+        .json::<UserAssets>()?
+        .find_matched_licenses()
+        // No UI yet, so just choosing first License
+        .next()
+        .map(|l| l.license_id.clone())
+        .ok_or(AuthError::NoValidAiLicenseFound)?;
+
+    let response = http
+        .post(format!(
+            "{JB_AI_API_URL}/auth/jetbrains-jwt/provide-access/license/v2"
+        ))
+        .bearer_auth(id_token)
+        .header(ACCEPT, "application/json")
+        .json(&grazie_license_v2::Request { license_id })
+        .send()?
+        .error_for_status()
+        .map_err(AuthError::AiToken)?
+        .json::<grazie_license_v2::Response>()?;
+
+    Ok(response.token)
+}
+
 /// Switches the token audience to get a JCP-scoped access token.
 ///
 /// https://youtrack.jetbrains.com/projects/JCP/articles/JCP-A-204/Refresh-Token-Flow#org-access-token
-fn switch_token_audience(
+fn retrieve_jcp_scoped_access_token(
     http_client: &Client,
     refresh_token: &str,
     org_info: &OrgInfo,
@@ -210,15 +258,9 @@ fn switch_token_audience(
             ("orgs_user_info", &org_info.raw_token),
             ("workspace_id", &org_info.workspace_id),
         ])
-        .send()?;
-
-    let status = response.status().as_u16();
-    if status != 200 {
-        return Err(AuthError::AudienceSwitch {
-            status,
-            body: response.text().unwrap_or_default(),
-        });
-    }
+        .send()?
+        .error_for_status()
+        .map_err(AuthError::AudienceSwitch)?;
 
     Ok(response.json::<OAuthTokenResponse>()?.access_token)
 }
@@ -305,10 +347,6 @@ fn extract_query_param(url: &Url, param_name: &str) -> Option<String> {
         .map(|(_, value)| value.into_owned())
 }
 
-// =============================================================================
-// Error Types
-// =============================================================================
-
 #[derive(Error, Debug)]
 pub enum AuthError {
     #[error("Failed to start local callback server: {0}")]
@@ -316,6 +354,12 @@ pub enum AuthError {
 
     #[error("OAuth server returned an error: {0}")]
     OAuthServer(String),
+
+    #[error("No valid AI License found")]
+    NoValidAiLicenseFound,
+
+    #[error("Missing IDToken in JCP OAuth response")]
+    MissingIdToken,
 
     #[error("Failed to exchange authorization code for tokens: {0}")]
     TokenExchange(#[source] Box<dyn std::error::Error + Send + Sync>),
@@ -326,8 +370,8 @@ pub enum AuthError {
     #[error("Missing refresh token in OAuth response")]
     MissingRefreshToken,
 
-    #[error("Failed to fetch organization info: {status} - {body}")]
-    OrgInfoFetch { status: u16, body: String },
+    #[error("Failed to fetch organization info: {0}")]
+    OrgInfoFetch(reqwest::Error),
 
     #[error("No organization found in user's account")]
     NoOrganization,
@@ -335,11 +379,17 @@ pub enum AuthError {
     #[error("No workspace found in user's organization")]
     NoWorkspace,
 
-    #[error("Failed to switch token audience: {status} - {body}")]
-    AudienceSwitch { status: u16, body: String },
+    #[error("Failed to switch token audience: {0}")]
+    AudienceSwitch(reqwest::Error),
 
-    #[error("Failed to refresh access token: {status} - {body}")]
-    TokenRefresh { status: u16, body: String },
+    #[error("Failed to refresh access token: {0}")]
+    TokenRefresh(reqwest::Error),
+
+    #[error("Failed to fetch license: {0}")]
+    License(reqwest::Error),
+
+    #[error("Failed to fetch AI token: {0}")]
+    AiToken(reqwest::Error),
 
     #[error("HTTP request failed: {0}")]
     ReqwestRequest(#[from] reqwest::Error),
@@ -352,6 +402,10 @@ pub enum AuthError {
 struct OAuthTokenResponse {
     #[serde(rename = "access_token")]
     access_token: String,
+
+    /// id_token is bound to `openid` OAuth-scope and can be missing from token response
+    #[serde(rename = "id_token")]
+    id_token: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -380,4 +434,151 @@ struct OrgInfo {
     org_id: String,
     workspace_id: String,
     raw_token: String,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct UserAssets {
+    #[serde(rename = "assets")]
+    pub assets: Vec<License>,
+}
+
+impl UserAssets {
+    pub fn find_matched_licenses(&self) -> impl Iterator<Item = &License> {
+        self.assets.iter().filter(|lic| {
+            !lic.cancelled
+                && !lic.suspended
+                && lic.allowances.iter().any(Allowance::is_ai_allowance)
+        })
+    }
+}
+
+/// Matching type for Grazie License API
+///
+/// https://code.jetbrains.team/p/grazi/repositories/grazie-platform/files/e6822ebbbf1c33110b9754ea9c3be776e5a2b654/api/api-gateway/api-gateway-api/src/commonMain/kotlin/ai/grazie/api/gateway/api/AuthAPI.kt?tab=source&line=157&lines-count=12
+mod grazie_license_v2 {
+    use super::*;
+
+    #[derive(Serialize)]
+    pub(super) struct Request {
+        #[serde(rename = "licenseId")]
+        pub(super) license_id: String,
+    }
+
+    #[derive(Deserialize)]
+    pub(super) struct Response {
+        #[serde(rename = "token")]
+        pub(super) token: String,
+    }
+}
+
+#[derive(Deserialize, Debug)]
+pub struct License {
+    #[serde(rename = "code")]
+    pub code: String,
+
+    #[serde(rename = "licenseId")]
+    pub license_id: String,
+
+    #[serde(rename = "suspended")]
+    pub suspended: bool,
+
+    #[serde(rename = "cancelled")]
+    pub cancelled: bool,
+
+    #[serde(rename = "allowance")]
+    pub allowances: Vec<Allowance>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct Allowance {
+    #[serde(rename = "code")]
+    pub code: String,
+
+    #[serde(rename = "name")]
+    pub name: String,
+}
+
+impl Allowance {
+    pub fn is_ai_allowance(&self) -> bool {
+        const ALLOW_ASSETS: [&str; 5] = ["AIP", "AIPU", "AIF", "AIL", "GZL"];
+        ALLOW_ASSETS.contains(&self.code.as_str())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn check_assets_deserialization() {
+        let json = json!(
+            {
+              "status": "OK",
+              "username": "john.doe@jetbrains.com",
+              "firstName": "John",
+              "lastName": "Doe",
+              "email": "john.doe@jetbrains.com",
+              "assets": [
+                {
+                  "code": "AIPU",
+                  "name": "JetBrains AI Ultimate",
+                  "description": "",
+                  "licenseId": "JPRK",
+                  "suspended": true,
+                  "cancelled": false,
+                  "overuseTill": "2026-12-17T00:00:00.000+0300",
+                  "version": "2025.2",
+                  "expires": "2026-12-16",
+                  "recurrent": false,
+                  "allowance": [ { "code": "AIPU", "name": "JetBrains AI Ultimate", "paidUpTo": "2026-12-16" } ]
+                },
+                {
+                  "code": "JUNP",
+                  "name": "Junie Pro",
+                  "description": "",
+                  "licenseId": "FGTJ2",
+                  "suspended": false,
+                  "cancelled": false,
+                  "overuseTill": "2026-12-31T00:00:00.000+0300",
+                  "expires": "2026-12-31",
+                  "recurrent": false,
+                  "allowance": [ { "code": "JUNP", "name": "Junie Pro", "paidUpTo": "2026-12-31" } ]
+                },
+                {
+                  "code": "AIRP",
+                  "name": "Air Preview",
+                  "description": "",
+                  "licenseId": "PRVU",
+                  "suspended": false,
+                  "cancelled": false,
+                  "overuseTill": "2026-03-31T00:00:00.000+0300",
+                  "expires": "2026-03-31",
+                  "recurrent": false,
+                  "allowance": [ { "code": "AIRP", "name": "Air Preview", "paidUpTo": "2026-03-31" } ]
+                },
+                {
+                  "code": "RR",
+                  "name": "RustRover",
+                  "description": "Rust IDE by JetBrains",
+                  "licenseId": "FUIMA",
+                  "suspended": false,
+                  "cancelled": false,
+                  "overuseTill": "2026-07-12T00:00:00.000+0300",
+                  "version": "2025.3",
+                  "expires": "2026-07-05",
+                  "recurrent": false,
+                  "allowance": [ { "code": "AIF", "name": "JetBrains AI Pro", "paidUpTo": "2026-07-05" } ]
+                }
+              ]
+            }
+        );
+
+        let r = serde_json::from_value::<UserAssets>(json).unwrap();
+        let license_ids = r
+            .find_matched_licenses()
+            .map(|l| &l.license_id)
+            .collect::<Vec<_>>();
+        assert_eq!(license_ids, vec!["FUIMA"]);
+    }
 }
