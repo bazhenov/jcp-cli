@@ -1,43 +1,14 @@
 use clap::{Parser, Subcommand};
 use dotenv::dotenv;
 use jcp::{
+    GitCommandTool,
     auth::{AccessTokens, get_access_tokens, login},
     keychain::{self, SecretBackend},
 };
-use std::process::Command;
 use std::{env, process};
 use tokio::runtime::Runtime;
 
-struct GitInfo {
-    url: String,
-    branch: String,
-    revision: String,
-}
-
-fn run_git(args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
-        .args(args)
-        .output()
-        .map_err(|e| format!("Failed to execute git: {}", e))?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-/// Retrieves git repository information from the current directory.
-/// Returns URL of the remote origin, current branch name, and HEAD commit SHA.
-fn get_git_info() -> Result<GitInfo, String> {
-    let url = run_git(&["remote", "get-url", "origin"])?;
-    let branch = run_git(&["rev-parse", "--abbrev-ref", "HEAD"])?;
-    let revision = run_git(&["rev-parse", "HEAD"])?;
-
-    Ok(GitInfo {
-        url,
-        branch,
-        revision,
-    })
-}
+const DEFAULT_JCP_URL: &str = "wss://api.stgn.jetbrains.cloud/agent-spawner/acp";
 
 #[derive(Parser)]
 #[command(name = "jcp", version)]
@@ -93,14 +64,12 @@ fn main() {
 
 fn run_adapter(keychain: &dyn SecretBackend) {
     use futures_util::StreamExt;
-    use jcp::{Adapter, Config, IoTransport, TrafficLog, WebSocketTransport};
+    use jcp::{Adapter, IoTransport, TrafficLog, WebSocketTransport};
     use tokio::io::{stdin, stdout};
     use tokio_tungstenite::connect_async;
     use tungstenite::client::IntoClientRequest;
 
-    let jcp_url = env::var("JCP_URL")
-        .ok()
-        .unwrap_or("wss://api.stgn.jetbrains.cloud/agent-spawner/acp".into());
+    let jcp_url = env::var("JCP_URL").ok().unwrap_or(DEFAULT_JCP_URL.into());
 
     let tokens = authenticate(keychain);
 
@@ -112,21 +81,6 @@ fn run_adapter(keychain: &dyn SecretBackend) {
             .unwrap(),
     );
 
-    let config = match get_git_info() {
-        Ok(git_info) => Ok(Config {
-            git_url: git_info.url,
-            branch: git_info.branch,
-            revision: git_info.revision,
-            ai_platform_token: tokens.ai_access_token,
-        }),
-        Err(e) => {
-            let desc =
-                format!("Failed to get git info. Program should be run in git working copy. {e}");
-            eprintln!("{desc}");
-            Err(desc)
-        }
-    };
-
     let runtime = Runtime::new().expect("Failed to create Tokio runtime");
     runtime.block_on(async {
         let traffic_log = TrafficLog::new(env::var("TRAFFIC_LOG").ok()).await.unwrap();
@@ -137,13 +91,14 @@ fn run_adapter(keychain: &dyn SecretBackend) {
         let downlink = IoTransport::new(stdin(), stdout());
         let uplink = WebSocketTransport::new(ws_rx, ws_tx);
 
-        let mut adapter = Adapter::new(config, Box::new(downlink), Box::new(uplink));
+        let mut adapter = Adapter::new(
+            Box::new(downlink),
+            Box::new(uplink),
+            Box::new(GitCommandTool),
+            tokens.ai_access_token,
+        );
         adapter.set_traffic_log(traffic_log);
-        while adapter
-            .handle_next_message()
-            .await
-            .expect("Unable to handle message")
-        {}
+        adapter.run().await.expect("Unable to handle message");
     });
 }
 

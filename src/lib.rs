@@ -9,7 +9,7 @@ use futures::{FutureExt, Sink, Stream};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use std::{collections::HashMap, io};
+use std::{collections::HashMap, io, path::Path, process::Command};
 use tokio::{
     fs::File,
     io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, Lines},
@@ -158,25 +158,34 @@ impl Transport for WebSocketTransport {
     }
 }
 
-/// Configuration for the ACP-JCP adapter
-#[derive(Clone)]
-pub struct Config {
-    pub git_url: String,
-    pub branch: String,
-    pub revision: String,
-    pub ai_platform_token: String,
+/// Reads git repository information from a working copy.
+pub trait GitTool {
+    fn read_remote_info(&self, path: &Path) -> Result<GitRemoteInfo, io::Error>;
 }
 
-impl Config {
-    pub fn new_session_meta(&self) -> NewSessionMeta {
-        NewSessionMeta {
-            remote: GitRemoteInfo {
-                branch: self.branch.clone(),
-                url: self.git_url.clone(),
-                revision: self.revision.clone(),
-            },
-            ai_platform_token: self.ai_platform_token.clone(),
-        }
+/// Reads git info by running git commands in the given directory
+pub struct GitCommandTool;
+
+impl GitTool for GitCommandTool {
+    fn read_remote_info(&self, path: &Path) -> Result<GitRemoteInfo, io::Error> {
+        let url = run_git(path, &["remote", "get-url", "origin"])?;
+        let branch = run_git(path, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+        let revision = run_git(path, &["rev-parse", "HEAD"])?;
+        Ok(GitRemoteInfo {
+            url,
+            branch,
+            revision,
+        })
+    }
+}
+
+fn run_git(cwd: &Path, args: &[&str]) -> Result<String, io::Error> {
+    let output = Command::new("git").current_dir(cwd).args(args).output()?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        let description = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(io::Error::other(description))
     }
 }
 
@@ -195,7 +204,7 @@ pub struct EndTurnMeta {
     pub target: GitRemoteInfo,
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 pub struct GitRemoteInfo {
     #[serde(rename = "branch")]
     pub branch: String,
@@ -237,10 +246,10 @@ pub struct RawIncomingMessage<'a> {
 /// This struct processes messages from both channels using `tokio::select!`,
 /// allowing for synchronous test-driving without spawning separate tasks.
 pub struct Adapter {
-    /// Can be missing, in which case adapter should report error on initialize handlshake
-    config: Result<Config, String>,
+    git_tool: Box<dyn GitTool>,
     client: Box<dyn Transport>,
     agent: Box<dyn Transport>,
+    ai_platform_token: String,
     traffic_log: TrafficLog,
 
     /// Mapping from prompt request id to session id
@@ -252,17 +261,20 @@ pub struct Adapter {
 impl Adapter {
     /// Create a new adapter with the given configuration and transports.
     ///
+    /// - `git_tool`: reads git info from working copies on new session requests
     /// - `downlink`: transport to the client (IDE)
     /// - `uplink`: transport to the server (JCP)
     pub fn new(
-        config: Result<Config, String>,
         client: Box<dyn Transport>,
         agent: Box<dyn Transport>,
+        git_tool: Box<dyn GitTool>,
+        ai_platform_token: String,
     ) -> Self {
         Self {
-            config,
+            ai_platform_token,
             client,
             agent,
+            git_tool,
             traffic_log: TrafficLog::default(),
             prompt_request_mapping: HashMap::new(),
         }
@@ -387,31 +399,35 @@ impl Adapter {
             let mut request = AgentSide::decode_request(method, rpc_msg.params)
                 .map_err(to_io_invalid_data_err)?;
 
-            if let ClientRequest::InitializeRequest(_) = request {
-                // On InitializeRequest we need to check all important preciditions and fail
-                // query to report a error to user if any.
-                if let Err(e) = &self.config {
-                    // no git config. Terminating protocol early
-                    let msg =
-                        JsonRpcMessage::wrap(AgentOutgoingMessage::Response(Response::Error {
-                            id: id.clone(),
-                            error: acp::Error::new(acp::ErrorCode::InvalidParams.into(), e),
-                        }));
-                    let value = serde_json::to_value(&msg).map_err(to_io_invalid_data_err)?;
-                    self.client.send(value).await?;
-
-                    return Err(io::Error::other(e.clone()));
-                }
-            } else if let ClientRequest::NewSessionRequest(r) = &mut request {
-                // On a NewSessionRequest we need to inject remote info (git url and branch)
+            if let ClientRequest::NewSessionRequest(r) = &mut request {
+                // Read git info from the session's working directory
                 //
-                // Assuming git config present, because we checking it on a init phase
-                let meta = self
-                    .config
-                    .as_ref()
-                    .expect("No config found")
-                    .new_session_meta();
-                inject_new_session_meta(r, &meta)?;
+                // NOTE: we using blocking call in async context here. It will block current task.
+                // We do it to preserve simple testing model. The adapter loop will be blocked until
+                // we read git info anyway. It only makes sense to solve this issue if we're will move to a fully
+                // multiplexed implementation where different sessions are processed independently.
+                match self.git_tool.read_remote_info(&r.cwd) {
+                    Ok(remote) => {
+                        let meta = NewSessionMeta {
+                            remote,
+                            ai_platform_token: self.ai_platform_token.clone(),
+                        };
+                        inject_new_session_meta(r, &meta)?;
+                    }
+                    Err(e) => {
+                        let msg =
+                            JsonRpcMessage::wrap(AgentOutgoingMessage::Response(Response::Error {
+                                id: id.clone(),
+                                error: acp::Error::new(
+                                    acp::ErrorCode::InvalidParams.into(),
+                                    e.to_string(),
+                                ),
+                            }));
+                        let value = serde_json::to_value(&msg).map_err(to_io_invalid_data_err)?;
+                        self.client.send(value).await?;
+                        return Ok(());
+                    }
+                }
             } else if let ClientRequest::PromptRequest(r) = &request {
                 self.prompt_request_mapping
                     .insert(id.clone(), r.session_id.clone());
@@ -658,9 +674,10 @@ mod tests {
         };
 
         let mut adapter = Adapter::new(
-            Err("No config".to_string()),
             Box::new(downlink),
             Box::new(uplink),
+            Box::new(NullGitTool),
+            "unused".to_string(),
         );
 
         let mut i = 0;
@@ -693,6 +710,14 @@ mod tests {
 
         for (_, result) in cancellations(init, recv) {
             assert_eq!(result.unwrap(), Some(expected.clone()));
+        }
+    }
+
+    struct NullGitTool;
+
+    impl GitTool for NullGitTool {
+        fn read_remote_info(&self, _path: &std::path::Path) -> Result<GitRemoteInfo, io::Error> {
+            panic!("GitTool should not be called in this test")
         }
     }
 }

@@ -71,14 +71,21 @@ fn run_outside_git_directory() {
         ..Default::default()
     });
 
-    match e2e.initialize_check() {
+    // Initialize should succeed even outside a git directory
+    e2e.initialize_check().expect("Initialize should succeed");
+
+    // NewSession should fail because cwd is not a git repository
+    let (response, _) = e2e.client_request::<NewSessionResponse>(ClientRequest::NewSessionRequest(
+        NewSessionRequest::new("./"),
+    ));
+    match response {
         Ok(r) => panic!("JSON RPC error is expected. Got: {r:?}"),
         Err(e) => {
             assert_eq!(e.code, acp::ErrorCode::InvalidParams);
             assert!(
                 e.message
-                    .contains("Program should be run in git working copy."),
-                "Expect git error message, got: {}",
+                    .contains("fatal: not a git repository (or any of the parent directories)"),
+                "Expected git error message, got: {}",
                 e.message
             );
         }

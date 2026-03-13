@@ -9,11 +9,21 @@ use agent_client_protocol::{
 };
 use async_trait::async_trait;
 use futures::FutureExt;
-use jcp::{Adapter, AgentOutgoingMessage, ClientOutgoingMessage, Config, Transport};
+use jcp::{
+    Adapter, AgentOutgoingMessage, ClientOutgoingMessage, GitRemoteInfo, GitTool, Transport,
+};
 use serde::de::DeserializeOwned;
 use serde_json::Value as JsonValue;
-use std::io;
+use std::{io, path::Path};
 use tokio::sync::mpsc;
+
+pub struct StubGitTool(pub GitRemoteInfo);
+
+impl GitTool for StubGitTool {
+    fn read_remote_info(&self, _path: &Path) -> Result<GitRemoteInfo, io::Error> {
+        Ok(self.0.clone())
+    }
+}
 
 /// Test harness for the Adapter.
 ///
@@ -54,15 +64,16 @@ macro_rules! now_or_panic {
 }
 
 impl TestHarness {
-    /// Bootstrap a new test harness with the given config.
-    pub fn new(config: Config) -> Self {
+    /// Bootstrap a new test harness with the given config and git tool stub.
+    pub fn new(ai_token: &str, git_tool: impl GitTool + 'static) -> Self {
         let (downlink_adapter, downlink_test) = ChannelTransport::pair(10);
         let (uplink_adapter, uplink_test) = ChannelTransport::pair(10);
 
         let adapter = Adapter::new(
-            Ok(config),
             Box::new(downlink_adapter),
             Box::new(uplink_adapter),
+            Box::new(git_tool),
+            ai_token.to_string(),
         );
 
         Self {
