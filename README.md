@@ -53,11 +53,7 @@ In `settings.json`:
   "JCP": {
     "type": "custom",
     "command": "jcp",
-    "args": ["acp"],
-    "env": {
-      // You can put AI_PLATFORM_TOKEN here or in .env file
-      "AI_PLATFORM_TOKEN": "...",
-    }
+    "args": ["acp"]
   }
 }
 ```
