@@ -83,7 +83,7 @@ fn run_adapter(keychain: &dyn SecretBackend) {
 
     let runtime = Runtime::new().expect("Failed to create Tokio runtime");
     runtime.block_on(async {
-        let traffic_log = TrafficLog::new(env::var("TRAFFIC_LOG").ok()).await.unwrap();
+        let traffic_log = TrafficLog::new(env::var("TRAFFIC_LOG").ok()).await;
 
         let (ws_stream, _) = connect_async(request).await.unwrap();
         let (ws_tx, ws_rx) = ws_stream.split();
@@ -97,7 +97,10 @@ fn run_adapter(keychain: &dyn SecretBackend) {
             Box::new(GitCommandTool),
             tokens.ai_access_token,
         );
-        adapter.set_traffic_log(traffic_log);
+        match traffic_log {
+            Ok(log) => adapter.set_traffic_log(log),
+            Err(e) => eprintln!("Unable to create traffic log: {e}"),
+        }
         adapter.run().await.expect("Unable to handle message");
     });
 }
