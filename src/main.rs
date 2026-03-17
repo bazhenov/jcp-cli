@@ -1,12 +1,22 @@
+use acp::{AgentSide, ClientRequest, ErrorCode, RequestId};
+use agent_client_protocol as acp;
 use clap::{Parser, Subcommand};
 use dotenv::dotenv;
+use futures_util::StreamExt;
 use jcp::{
-    GitCommandTool,
-    auth::{AccessTokens, get_access_tokens, login},
-    keychain::{self, SecretBackend},
+    Adapter, GitCommandTool, IoTransport, JCP_URL_ENV_NAME, TrafficLog, Transport,
+    WebSocketTransport,
+    auth::{self, AccessTokens, get_access_tokens, login},
+    decode_acp_request,
+    keychain::{self, AI_PLATFORM_TOKEN_ENV_NAME, JCP_ACCESS_TOKEN_ENV_NAME, SecretBackend},
+    request_id,
 };
-use std::{env, process};
+use serde_json::Value as JsonValue;
+use std::{env, io, process};
+use thiserror::Error;
+use tokio::io::{stdin, stdout};
 use tokio::runtime::Runtime;
+use tungstenite::client::IntoClientRequest;
 
 const DEFAULT_JCP_URL: &str = "wss://api.stgn.jetbrains.cloud/agent-spawner/acp";
 
@@ -63,79 +73,186 @@ fn main() {
 }
 
 fn run_adapter(keychain: &dyn SecretBackend) {
-    use futures_util::StreamExt;
-    use jcp::{Adapter, IoTransport, TrafficLog, WebSocketTransport};
-    use tokio::io::{stdin, stdout};
-    use tokio_tungstenite::connect_async;
-    use tungstenite::client::IntoClientRequest;
-
-    let jcp_url = env::var("JCP_URL").ok().unwrap_or(DEFAULT_JCP_URL.into());
-
-    let tokens = authenticate(keychain);
-
-    let mut request = jcp_url.into_client_request().unwrap();
-    request.headers_mut().insert(
-        "Authorization",
-        format!("Bearer {}", tokens.jcp_access_token)
-            .parse()
-            .unwrap(),
-    );
+    let jcp_url = env::var(JCP_URL_ENV_NAME)
+        .ok()
+        .unwrap_or(DEFAULT_JCP_URL.into());
 
     let runtime = Runtime::new().expect("Failed to create Tokio runtime");
     runtime.block_on(async {
         let traffic_log = TrafficLog::new(env::var("TRAFFIC_LOG").ok()).await;
 
-        let (ws_stream, _) = connect_async(request).await.unwrap();
-        let (ws_tx, ws_rx) = ws_stream.split();
+        let mut client = IoTransport::new(stdin(), stdout());
 
-        let downlink = IoTransport::new(stdin(), stdout());
-        let uplink = WebSocketTransport::new(ws_rx, ws_tx);
+        // This code is rather tricky.
+        //
+        // We generally are not interested in client transport errors, because if client transport failed
+        // we don't have any other option but panic. But in case of any other error we need to properly
+        // report error as an JSON RPC error to a client, because this is how IDE will know something
+        // went wrong and properly show error message to an end user.
 
-        let mut adapter = Adapter::new(
-            Box::new(downlink),
-            Box::new(uplink),
-            Box::new(GitCommandTool),
-            tokens.ai_access_token,
-        );
-        match traffic_log {
-            Ok(log) => adapter.set_traffic_log(log),
-            Err(e) => eprintln!("Unable to create traffic log: {e}"),
+        // Read the first message from the client in order to save request_id which we need to
+        // properly report errors if they will happen
+        let init_msg = client
+            .recv()
+            .await
+            .expect("Unable to read message")
+            .expect("Unexpected EOF");
+        let request_id = request_id(&init_msg).unwrap_or(RequestId::Null);
+
+        match handshake_and_authenticate(&mut client, init_msg, keychain, &jcp_url).await {
+            Ok((uplink, tokens)) => {
+                // Run the adapter for the remainder of the session
+                let mut adapter = Adapter::new(
+                    Box::new(client),
+                    Box::new(uplink),
+                    Box::new(GitCommandTool),
+                    tokens.ai_access_token,
+                );
+                match traffic_log {
+                    Ok(log) => adapter.set_traffic_log(log),
+                    Err(e) => eprintln!("Unable to create traffic log: {e}"),
+                }
+                adapter.run().await.expect("Unable to handle message");
+            }
+            Err(e) => {
+                // Report the initialization failure back to the client
+                // Error reporting is happening via JSON RPC channel, we can not rely on IDE monitoring stderr,
+                // but for the sake of convenience we report error to both channels
+                match create_json_rpc_error(&e, request_id) {
+                    Ok(err) => {
+                        let _ = client.send(err).await.ok();
+                    }
+                    Err(e) => eprintln!("Unable to send JSON RPC error: {e}"),
+                }
+                panic!("{e}");
+            }
         }
-        adapter.run().await.expect("Unable to handle message");
     });
+}
+
+/// Authenticates and opens a WebSocket connection to the JCP uplink.
+///
+/// Returns the connected [`WebSocketTransport`], and a resolved [`AccessTokens`] on success,
+/// or an error that MUST be forwarded to the client.
+///
+/// After this method returned both transport considered ready and can be passed to an adapter
+async fn handshake_and_authenticate(
+    client: &mut dyn Transport,
+    initialize_request: JsonValue,
+    keychain: &dyn SecretBackend,
+    jcp_url: &str,
+) -> Result<(WebSocketTransport, AccessTokens), Error> {
+    // Checking that this is indeed InitializeRequest
+    let Some((_, _, ClientRequest::InitializeRequest(_))) =
+        decode_acp_request::<AgentSide>(&initialize_request)?
+    else {
+        return Err(io::Error::other("InitializeRequest expected").into());
+    };
+
+    let tokens = authenticate(keychain)?;
+
+    let mut request = jcp_url
+        .into_client_request()
+        .map_err(|e| Error::InvalidUrl(jcp_url.to_string(), e))?;
+    request.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {}", tokens.jcp_access_token)
+            .parse()
+            .map_err(|_| {
+                // Intentionally masking original error here, to prevent any possible secret leak
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Illegal token value. Only ASCII characters are allowed",
+                )
+            })?,
+    );
+
+    // Establishing WebSocket connection
+    let (ws_stream, _) = tokio_tungstenite::connect_async(request).await?;
+    let (ws_tx, ws_rx) = ws_stream.split();
+
+    let mut agent = WebSocketTransport::new(ws_rx, ws_tx);
+
+    // Forward InitializeRequest to the uplink server
+    agent.send(initialize_request).await?;
+
+    let init_response = agent.recv().await?.ok_or(io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        "Agent reset connection",
+    ))?;
+    // Forwarding `InitializeResponse` from an agent to a client. We're assuming this is reply to
+    // `InitializeRequest`. It might be not a successful result, but a JSON RPC error, hence we do not
+    // deserialize it here
+    client
+        .send(init_response)
+        .await
+        // If client transport has failed we don't have any other option but panic
+        .expect("Unable to send response");
+
+    Ok((agent, tokens))
 }
 
 /// Retrieves access tokens
 ///
-/// If both `AI_PLATFORM_TOKEN` and `JCP_ACCESS_TOKEN` are present, then they are used.
-/// If not, refresh token is retrieved from a keychain and after that fresh access tokens are requested.
-/// `AI_PLATFORM_TOKEN` and `JCP_ACCESS_TOKEN` env variables still allows to override respective tokens.
-fn authenticate(keychain: &dyn SecretBackend) -> AccessTokens {
-    let jb_ai = env::var("AI_PLATFORM_TOKEN").ok();
-    let jcp = env::var("JCP_ACCESS_TOKEN").ok();
+/// If both env-variables with access tokens are present, then they are used (see [`AI_PLATFORM_TOKEN_ENV_NAME`],
+/// [`JCP_ACCESS_TOKEN_ENV_NAME`]). If not, the refresh token is retrieved
+/// from the keychain and fresh access tokens are requested.
+/// Env variables still allow overriding respective tokens.
+fn authenticate(keychain: &dyn SecretBackend) -> Result<AccessTokens, Error> {
+    let jb_ai = env::var(AI_PLATFORM_TOKEN_ENV_NAME).ok();
+    let jcp = env::var(JCP_ACCESS_TOKEN_ENV_NAME).ok();
 
-    if let Some((jb_ai_access_token, jcp_access_token)) = jb_ai.as_ref().zip(jcp.as_ref()) {
+    let access_tokens = if let Some((jb_ai_token, jcp_token)) = jb_ai.as_ref().zip(jcp.as_ref()) {
         AccessTokens {
-            jcp_access_token: jcp_access_token.to_string(),
-            ai_access_token: jb_ai_access_token.to_string(),
+            jcp_access_token: jcp_token.to_string(),
+            ai_access_token: jb_ai_token.to_string(),
         }
     } else {
-        // Try to get refresh token from keychain and upgrade it
-        let Some(refresh_token) = keychain.get_refresh_token().unwrap() else {
-            eprintln!("No refresh token found");
-            eprintln!("Please run `acp-jcp login` to authenticate.");
-            process::exit(1);
-        };
-        match get_access_tokens(&refresh_token) {
-            Ok(tokens) => AccessTokens {
-                jcp_access_token: jcp.unwrap_or(tokens.jcp_access_token),
-                ai_access_token: jb_ai.unwrap_or(tokens.ai_access_token),
-            },
-            Err(e) => {
-                eprintln!("Failed to get access token: {}", e);
-                eprintln!("Please run `acp-jcp login` to re-authenticate.");
-                process::exit(1);
-            }
+        let refresh_token = keychain.get_refresh_token()?.ok_or(Error::NoRefreshToken)?;
+        let access_tokens = get_access_tokens(&refresh_token)?;
+        AccessTokens {
+            jcp_access_token: jcp.unwrap_or(access_tokens.jcp_access_token),
+            ai_access_token: jb_ai.unwrap_or(access_tokens.ai_access_token),
         }
-    }
+    };
+    Ok(access_tokens)
+}
+
+#[derive(Error, Debug)]
+pub enum Error {
+    #[error("Authentication error: {0}")]
+    UnableToGetAccessToken(#[from] auth::AuthError),
+
+    #[error("IO error: {0}")]
+    Io(#[from] io::Error),
+
+    #[error("No refresh token found")]
+    NoRefreshToken,
+
+    #[error("WebSocket failed: {0}")]
+    WebSocket(#[from] tungstenite::Error),
+
+    #[error("Invalid URL: {1}, url: {0}")]
+    InvalidUrl(String, tungstenite::Error),
+
+    #[error("Invalid ACP message: {0}")]
+    InvalidAcpMessage(#[from] acp::Error),
+}
+
+/// Creates a new JSON RPC error replyfor a given request id
+fn create_json_rpc_error(
+    error: &Error,
+    original_request_id: RequestId,
+) -> serde_json::Result<JsonValue> {
+    let message = match error {
+        Error::UnableToGetAccessToken(e) => format!(
+            "Unable to get Access Tokens. Try relogin with `jcp logout && jcp login`. Details: {e}"
+        ),
+        Error::NoRefreshToken => "Please login with `jcp login` first".to_string(),
+        Error::InvalidUrl(url, _) => format!("Invalid URL given: {url}"),
+        e => e.to_string(),
+    };
+    let error = acp::Error::new(ErrorCode::InvalidRequest.into(), message);
+    let message = acp::Response::<()>::new(original_request_id, Err(error));
+    serde_json::to_value(acp::JsonRpcMessage::wrap(message))
 }

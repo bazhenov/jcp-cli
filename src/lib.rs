@@ -22,6 +22,9 @@ use tungstenite::{
 pub mod auth;
 pub mod keychain;
 
+/// The name of environment variable that defines the URL t JCP WS API
+pub const JCP_URL_ENV_NAME: &str = "JCP_URL";
+
 pub type AgentOutgoingMessage = OutgoingMessage<AgentSide, ClientSide>;
 pub type ClientOutgoingMessage = OutgoingMessage<ClientSide, AgentSide>;
 
@@ -261,9 +264,12 @@ pub struct Adapter {
 impl Adapter {
     /// Create a new adapter with the given configuration and transports.
     ///
+    /// - `client` (downlink): transport to the client (IDE)
+    /// - `agent` (uplink): transport to the server (JCP)
     /// - `git_tool`: reads git info from working copies on new session requests
-    /// - `downlink`: transport to the client (IDE)
-    /// - `uplink`: transport to the server (JCP)
+    ///
+    /// Both transports are assumed to be initialized. Meaning that `InitializeRequest`/`InitializeResponse`
+    /// already processed by agent and client respectively
     pub fn new(
         client: Box<dyn Transport>,
         agent: Box<dyn Transport>,
@@ -389,16 +395,9 @@ impl Adapter {
     async fn handle_client_message(&mut self, msg: JsonValue) -> io::Result<()> {
         let _ = self.traffic_log.write(&msg).await;
 
-        // This is ugly hack, but we need to serialize here back to string, otherwise
-        // we can not use AgentSide::decode_request()
-        let msg_str = msg.to_string();
-        let rpc_msg: RawIncomingMessage<'_> =
-            serde_json::from_str(&msg_str).map_err(to_io_invalid_data_err)?;
-
-        if let Some((method, id)) = rpc_msg.method.zip(rpc_msg.id) {
-            let mut request = AgentSide::decode_request(method, rpc_msg.params)
-                .map_err(to_io_invalid_data_err)?;
-
+        if let Some((id, method, mut request)) =
+            decode_acp_request::<AgentSide>(&msg).map_err(to_io_invalid_data_err)?
+        {
             if let ClientRequest::NewSessionRequest(r) = &mut request {
                 // Read git info from the session's working directory
                 //
@@ -469,6 +468,37 @@ fn git_end_turn_message(git_info: GitRemoteInfo) -> Option<String> {
         ))
     } else {
         None
+    }
+}
+
+/// Reads [`RequestId`] from a JSON RPC payload and returns if any
+pub fn request_id(json_rpc: &JsonValue) -> Option<RequestId> {
+    match &json_rpc["id"] {
+        JsonValue::Null => Some(RequestId::Null),
+        JsonValue::Number(n) => n.as_i64().map(RequestId::Number),
+        JsonValue::String(s) => Some(RequestId::Str(s.clone())),
+        _ => None,
+    }
+}
+
+/// Reads [`RequestId`], method name and request itself from a JSON RPC request payload
+pub fn decode_acp_request<T: Side>(
+    json_rpc: &JsonValue,
+) -> Result<Option<(RequestId, String, T::InRequest)>, acp::Error> {
+    // This is ugly hack, but we need to serialize here back to string, otherwise
+    // we can not use AgentSide::decode_request()
+    let msg_str = json_rpc.to_string();
+    // SAFETY: unwrap() is safe here, because we're serialized proper json on a previous line
+    let rpc_msg: RawIncomingMessage<'_> = serde_json::from_str(&msg_str).unwrap();
+    if let Some((method, id)) = rpc_msg.method.zip(rpc_msg.id) {
+        Ok(Some((
+            id,
+            method.to_string(),
+            T::decode_request(method, rpc_msg.params)?,
+        )))
+    } else {
+        // Not a request
+        Ok(None)
     }
 }
 
