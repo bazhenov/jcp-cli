@@ -5,7 +5,7 @@ use agent_client_protocol::{
     SessionUpdate, Side, StopReason, TextContent,
 };
 use async_trait::async_trait;
-use futures::{FutureExt, Sink, Stream};
+use futures::FutureExt;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -13,7 +13,9 @@ use std::{collections::HashMap, io, path::Path, process::Command};
 use tokio::{
     fs::File,
     io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, Lines},
+    net::TcpStream,
 };
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tungstenite::{
     Message, Utf8Bytes,
     protocol::{CloseFrame, frame::coding::CloseCode},
@@ -42,6 +44,14 @@ pub trait Transport {
 
     /// Send a message through the transport.
     async fn send(&mut self, msg: JsonValue) -> io::Result<()>;
+
+    /// Closes transport gracefully, flushing all pending outgoing messages.
+    ///
+    /// NOTE: because it's not possible to automatically read all messages and close the Transport,
+    /// some pending incoming messages might be dropped on close. In order to fix it
+    /// this method should return `io::Result<Vec<JsonValue>>`. But at the moment
+    /// shutdown contract is such that we can not do anything with those messages anyway.
+    async fn close(self: Box<Self>) -> io::Result<()>;
 }
 
 /// Transport implementation for arbitrary async readers/writers.
@@ -84,23 +94,21 @@ impl Transport for IoTransport {
         self.writer.write_all(b"\n").await?;
         self.writer.flush().await
     }
+
+    async fn close(self: Box<Self>) -> io::Result<()> {
+        // We do flush on send, hence nothing to do
+        Ok(())
+    }
 }
 
 /// Transport implementation for WebSocket connections.
 pub struct WebSocketTransport {
-    rx: Box<dyn Stream<Item = Result<Message, tungstenite::Error>> + Unpin + Send>,
-    tx: Box<dyn Sink<Message, Error = tungstenite::Error> + Unpin + Send>,
+    ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
 }
 
 impl WebSocketTransport {
-    pub fn new(
-        rx: impl Stream<Item = Result<Message, tungstenite::Error>> + Unpin + Send + 'static,
-        tx: impl Sink<Message, Error = tungstenite::Error> + Unpin + Send + 'static,
-    ) -> Self {
-        Self {
-            rx: Box::new(rx),
-            tx: Box::new(tx),
-        }
+    pub fn new(ws: WebSocketStream<MaybeTlsStream<TcpStream>>) -> Self {
+        Self { ws }
     }
 }
 
@@ -108,7 +116,7 @@ impl WebSocketTransport {
 impl Transport for WebSocketTransport {
     async fn recv(&mut self) -> io::Result<Option<JsonValue>> {
         loop {
-            match self.rx.next().await {
+            match self.ws.next().await {
                 Some(Ok(msg)) => match msg {
                     Message::Text(text) => {
                         return serde_json::from_str(&text)
@@ -120,7 +128,7 @@ impl Transport for WebSocketTransport {
                         continue;
                     }
                     Message::Ping(bytes) => {
-                        self.tx
+                        self.ws
                             .send(Message::Pong(bytes))
                             .await
                             .map_err(io::Error::other)?;
@@ -129,7 +137,7 @@ impl Transport for WebSocketTransport {
                     Message::Pong(_) => continue,
                     Message::Close(close_frame) => {
                         // Replying with the close frame
-                        let _ = self.tx.send(Message::Close(None)).await;
+                        let _ = self.ws.send(Message::Close(None)).await;
                         return match close_frame {
                             Some(CloseFrame {
                                 code: CloseCode::Normal,
@@ -157,7 +165,19 @@ impl Transport for WebSocketTransport {
             .map_err(to_io_invalid_data_err)
             .map(Utf8Bytes::from)
             .map(Message::Text)?;
-        self.tx.send(message).await.map_err(io::Error::other)
+        self.ws.send(message).await.map_err(io::Error::other)
+    }
+
+    async fn close(mut self: Box<Self>) -> io::Result<()> {
+        let close_frame = CloseFrame {
+            code: CloseCode::Away,
+            reason: Utf8Bytes::default(),
+        };
+        self.ws
+            .close(Some(close_frame))
+            .await
+            .map_err(to_io_invalid_data_err)?;
+        self.ws.flush().await.map_err(to_io_invalid_data_err)
     }
 }
 
@@ -293,51 +313,23 @@ impl Adapter {
     /// Process the next message from either the client or server channel.
     ///
     /// Returns `true` if there are more messages that can be handled
-    /// Returns `false` when both channels are closed (end of communication).
+    /// Returns `false` when one of the channels is closed (end of communication).
     pub async fn handle_next_message(&mut self) -> io::Result<bool> {
-        use Status::*;
-        enum Status {
-            AgentTerminated,
-            ClientTerminated,
-            MessageProcessed,
-        }
-
-        let result = tokio::select! {
+        tokio::select! {
             // We don't care about message processing order fairness, but random selection
             // makes tests non deterministic, hence biased.
             biased;
             msg = self.client.recv() => {
                 if let Some(msg) = msg? {
                     self.handle_client_message(msg).await?;
-                    MessageProcessed
-                } else {
-                    ClientTerminated
-                }
-            }
-            msg = self.agent.recv() => {
-                if let Some(msg) = msg? {
-                    self.handle_agent_message(msg).await?;
-                    MessageProcessed
-                } else {
-                    AgentTerminated
-                }
-            }
-        };
-
-        // If one of the transports reported EOF, we still need to process another one
-        match result {
-            MessageProcessed => Ok(true),
-            ClientTerminated => {
-                if let Some(msg) = self.agent.recv().await? {
-                    self.handle_agent_message(msg).await?;
                     Ok(true)
                 } else {
                     Ok(false)
                 }
             }
-            AgentTerminated => {
-                if let Some(msg) = self.client.recv().await? {
-                    self.handle_client_message(msg).await?;
+            msg = self.agent.recv() => {
+                if let Some(msg) = msg? {
+                    self.handle_agent_message(msg).await?;
                     Ok(true)
                 } else {
                     Ok(false)
@@ -453,6 +445,18 @@ impl Adapter {
         while self.handle_next_message().await? {}
         Ok(())
     }
+
+    pub async fn shutdown(self) -> io::Result<()> {
+        let (agent_result, client_result) = tokio::join!(self.agent.close(), self.client.close());
+        // Return encountered error if any
+        client_result.and(agent_result)
+    }
+
+    /// Closing adapter and returning client and agent transports respectively without closing them
+    #[cfg(test)]
+    pub fn into_inner(self) -> (Box<dyn Transport>, Box<dyn Transport>) {
+        (self.client, self.agent)
+    }
 }
 
 fn git_end_turn_message(git_info: GitRemoteInfo) -> Option<String> {
@@ -559,7 +563,9 @@ fn to_io_invalid_data_err<E: Into<Box<dyn std::error::Error + Send + Sync>>>(e: 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::{AgentSide, ClientRequest, LoadSessionRequest, Side};
+    use acp::{
+        AgentResponse, AgentSide, ClientRequest, LoadSessionRequest, LoadSessionResponse, Side,
+    };
     use drop_check::{IntersperceExt, cancellations};
     use serde::de::DeserializeOwned;
     use serde_json::{Value, json};
@@ -678,34 +684,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn adapter_should_consume_all_messages() {
-        const MESSAGE_REPETITIONS: usize = 10;
+    async fn adapter_should_consume_all_client_messages() {
+        const CLIENT_MESSAGE_REPETITIONS: usize = 5;
+        const AGENT_MESSAGE_REPETITIONS: usize = 10;
 
-        let downlink = {
+        let client = {
             let request = ClientRequest::LoadSessionRequest(LoadSessionRequest::new("1", "/"));
             let mut message = serde_json::to_string(&request).unwrap();
             message.push('\n');
 
             IoTransport::new(
-                Cursor::new(message.repeat(MESSAGE_REPETITIONS).into_bytes()),
+                Cursor::new(message.repeat(CLIENT_MESSAGE_REPETITIONS).into_bytes()),
                 vec![],
             )
         };
 
-        let uplink = {
-            let request = ClientRequest::LoadSessionRequest(LoadSessionRequest::new("1", "/"));
+        let agent = {
+            let request = AgentResponse::LoadSessionResponse(LoadSessionResponse::new());
             let mut message = serde_json::to_string(&request).unwrap();
             message.push('\n');
 
             IoTransport::new(
-                Cursor::new(message.repeat(MESSAGE_REPETITIONS).into_bytes()),
+                Cursor::new(message.repeat(AGENT_MESSAGE_REPETITIONS).into_bytes()),
                 vec![],
             )
         };
 
         let mut adapter = Adapter::new(
-            Box::new(downlink),
-            Box::new(uplink),
+            Box::new(client),
+            Box::new(agent),
             Box::new(NullGitTool),
             "unused".to_string(),
         );
@@ -715,11 +722,20 @@ mod tests {
             i += 1;
         }
 
-        assert_eq!(
-            i,
-            MESSAGE_REPETITIONS * 2,
-            "{MESSAGE_REPETITIONS} should be processed from each of the side (agent, client)"
+        // The number of processed messages might not be deterministic,
+        // but at least one channel should be processed fully.
+        let min_expected_messages_cnt = CLIENT_MESSAGE_REPETITIONS.min(AGENT_MESSAGE_REPETITIONS);
+        assert!(
+            i >= min_expected_messages_cnt,
+            "At least {min_expected_messages_cnt} messages should be processed"
         );
+
+        // Getting transports back and checking that at least one of them is fully consumed
+        let (mut client, mut agent) = adapter.into_inner();
+        assert!(
+            matches!(client.recv().await, Ok(None)) || matches!(agent.recv().await, Ok(None)),
+            "At least of transport should be fully consumed"
+        )
     }
 
     #[test]

@@ -174,7 +174,7 @@ impl TestHarness {
     /// After this method was called it is safe to assume that all requests were sent to their
     /// counterparties
     fn deliver_transport_messages(&mut self) {
-        now_or_panic!(self.adapter.handle_enqueued_messages()).unwrap()
+        now_or_panic!(self.adapter.handle_enqueued_messages()).unwrap();
     }
 }
 
@@ -213,6 +213,10 @@ impl Transport for ChannelTransport {
 
     async fn send(&mut self, msg: JsonValue) -> io::Result<()> {
         self.tx.send(msg).await.map_err(io::Error::other)
+    }
+
+    async fn close(self: Box<Self>) -> io::Result<()> {
+        Ok(())
     }
 }
 
